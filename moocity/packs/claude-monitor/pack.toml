@@ -1,0 +1,29 @@
+# claude-monitor — Enterprise institutional memory service pack.
+#
+# Domain: memory ingestion, cross-zgent recall, activity summarization,
+# knowledge graph maintenance. The enterprise's memory and recall layer.
+
+[pack]
+name = "claude-monitor"
+schema = 2
+
+[imports.moocity]
+source = "../moocity"
+
+[[named_session]]
+template = "polecat"
+scope = "rig"
+mode = "on_demand"
+
+# Domain formulas (activate as workflows are built):
+# [[formula]]
+# name = "memory-ingest"
+# description = "Ingest and index new observations from zgent sessions"
+#
+# [[formula]]
+# name = "cross-zgent-recall"
+# description = "Query enterprise memory for context relevant to a request"
+#
+# [[formula]]
+# name = "activity-summarize"
+# description = "Produce activity summaries across enterprise sessions"

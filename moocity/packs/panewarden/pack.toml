@@ -1,0 +1,29 @@
+# PaneWarden — Presentation-layer steward pack.
+#
+# Domain: tmux session management, layout orchestration, status lines,
+# cross-session attendance. Broad tmux WRITE across enterprise.
+
+[pack]
+name = "panewarden"
+schema = 2
+
+[imports.moocity]
+source = "../moocity"
+
+[[named_session]]
+template = "polecat"
+scope = "rig"
+mode = "on_demand"
+
+# Domain formulas (activate as workflows are built):
+# [[formula]]
+# name = "layout-stage"
+# description = "Stage a tmux layout for a meeting or focus session"
+#
+# [[formula]]
+# name = "session-audit"
+# description = "Audit tmux sessions for orphans, stale panes, layout drift"
+#
+# [[formula]]
+# name = "status-refresh"
+# description = "Rebuild status lines across enterprise sessions"

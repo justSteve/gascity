@@ -1,0 +1,29 @@
+# DataArchive — Persistent storage and retrieval service pack.
+#
+# Domain: drive scanning, dedup, indexing, artifact storage on Z:.
+# Consolidates decades of digital history into a coherent archive.
+
+[pack]
+name = "dataarchive"
+schema = 2
+
+[imports.moocity]
+source = "../moocity"
+
+[[named_session]]
+template = "polecat"
+scope = "rig"
+mode = "on_demand"
+
+# Domain formulas (activate as workflows are built):
+# [[formula]]
+# name = "drive-scan"
+# description = "Scan a mounted drive and catalog contents"
+#
+# [[formula]]
+# name = "dedup-index"
+# description = "Deduplicate and index newly scanned artifacts"
+#
+# [[formula]]
+# name = "archive-integrity"
+# description = "Verify archive integrity and report drift"

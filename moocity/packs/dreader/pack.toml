@@ -1,0 +1,29 @@
+# DReader — Discord intelligence collector pack.
+#
+# Domain: browser-based Discord scraping, channel indexing, query API.
+# Constraint: no Discord API access — all retrieval via DOM scraping.
+
+[pack]
+name = "dreader"
+schema = 2
+
+[imports.moocity]
+source = "../moocity"
+
+[[named_session]]
+template = "polecat"
+scope = "rig"
+mode = "on_demand"
+
+# Domain formulas (activate as workflows are built):
+# [[formula]]
+# name = "channel-scan"
+# description = "Scrape and index a Discord channel via browser automation"
+#
+# [[formula]]
+# name = "thread-reconstruct"
+# description = "Reconstruct threaded conversation from raw scraped messages"
+#
+# [[formula]]
+# name = "query-api-refresh"
+# description = "Rebuild query indexes after new data ingestion"

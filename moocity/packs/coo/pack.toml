@@ -1,0 +1,29 @@
+# COO — Enterprise operations and conventions pack.
+#
+# Domain: factory pipeline, convention deployment, zgent certification,
+# cross-enterprise tooling. COO builds what every other zgent depends on.
+
+[pack]
+name = "coo"
+schema = 2
+
+[imports.moocity]
+source = "../moocity"
+
+[[named_session]]
+template = "polecat"
+scope = "rig"
+mode = "on_demand"
+
+# Domain formulas (activate as workflows are built):
+# [[formula]]
+# name = "convention-deploy"
+# description = "Deploy a convention artifact from CSO catalog to target zgents"
+#
+# [[formula]]
+# name = "zgent-audit"
+# description = "Validate a zgent repo against current certification requirements"
+#
+# [[formula]]
+# name = "factory-rebuild"
+# description = "Rebuild factory image from factory.env single source of truth"

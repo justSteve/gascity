@@ -1,0 +1,29 @@
+# BitWarden — Enterprise credential management pack.
+#
+# Domain: credential rotation, secret provisioning, access audit, vault sync.
+# Restricted infrastructure — highest security sensitivity in the enterprise.
+
+[pack]
+name = "bitwarden"
+schema = 2
+
+[imports.moocity]
+source = "../moocity"
+
+[[named_session]]
+template = "polecat"
+scope = "rig"
+mode = "on_demand"
+
+# Domain formulas (activate as workflows are built):
+# [[formula]]
+# name = "credential-rotate"
+# description = "Rotate credentials for a specified service or zgent"
+#
+# [[formula]]
+# name = "access-audit"
+# description = "Audit credential access patterns across enterprise"
+#
+# [[formula]]
+# name = "vault-sync"
+# description = "Sync vault state with upstream BitWarden instance"

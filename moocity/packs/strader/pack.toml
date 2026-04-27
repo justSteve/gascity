@@ -1,0 +1,29 @@
+# Strader — SPX options trading intelligence pack.
+#
+# Domain: 0DTE options analysis, LuxAlgo indicator suite, pattern detection.
+# Hard boundary: never places/modifies/cancels orders without human confirmation.
+
+[pack]
+name = "strader"
+schema = 2
+
+[imports.moocity]
+source = "../moocity"
+
+[[named_session]]
+template = "polecat"
+scope = "rig"
+mode = "on_demand"
+
+# Domain formulas (activate as workflows are built):
+# [[formula]]
+# name = "market-analysis"
+# description = "Run indicator suite and produce regime/structure analysis"
+#
+# [[formula]]
+# name = "strategy-backtest"
+# description = "Backtest a strategy against historical SPX data"
+#
+# [[formula]]
+# name = "pattern-scan"
+# description = "Scan current session for 0DTE pattern setups"
