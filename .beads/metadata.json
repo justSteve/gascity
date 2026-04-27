@@ -1,0 +1,9 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "server",
+  "dolt_database": "mc",
+  "project_id": "f5fd71ff-833d-42bc-936b-a2a39ccbaab1",
+  "dolt_host": "127.0.0.1",
+  "dolt_user": "root"
+}

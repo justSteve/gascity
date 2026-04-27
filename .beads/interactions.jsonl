@@ -1,0 +1,1 @@
+{"id":"int-10068736","kind":"field_change","created_at":"2026-04-27T07:48:39.641414291Z","actor":"Steve","issue_id":"justStevesCity-ae2","extra":{"field":"status","new_value":"closed","old_value":"in_progress","reason":"City bootstrapped, 9 rigs registered, 10 packs loaded, gc start successful. All zgents onboarded as GC packs."}}
