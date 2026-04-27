@@ -1,0 +1,1 @@
+../../../../../examples/gastown/packs/gastown/assets/scripts/worktree-setup.sh

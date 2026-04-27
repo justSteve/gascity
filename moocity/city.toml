@@ -1,0 +1,28 @@
+# Moocity — Steve's zgent enterprise expressed as a Gas City workspace.
+#
+# Architecture:
+#   - One city, all zgents run as rigs
+#   - COO is the city-scoped coordinator (meta-tool, not runtime orchestrator)
+#   - Polecats are rig-scoped coding workers
+#   - Each zgent repo registered as a rig gets rig-scoped agents stamped
+#
+# To use: gc start moocity/
+
+[workspace]
+name = "moocity"
+provider = "claude"
+
+[imports.moocity]
+source = "packs/moocity"
+
+[daemon]
+patrol_interval = "30s"
+max_restarts = 5
+restart_window = "1h"
+shutdown_timeout = "5s"
+formula_v2 = true
+
+# Register zgent repos as rigs to activate rig-scoped agents:
+# [[rigs]]
+# name = "zgent-name"
+# path = "/root/projects/ZgentName"

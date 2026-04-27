@@ -1,0 +1,23 @@
+# Moocity — enterprise orchestration pack.
+#
+# City-scoped: COO (enterprise coordinator, meta-tool)
+# Rig-scoped: polecat (coding workers per zgent)
+#
+# Imports maintenance for standard infrastructure (dog pool, exec orders).
+
+[pack]
+name = "moocity"
+schema = 2
+
+[imports.maintenance]
+source = "../../../examples/gastown/packs/maintenance"
+
+[[named_session]]
+template = "coo"
+scope = "city"
+mode = "always"
+
+[[named_session]]
+template = "polecat"
+scope = "rig"
+mode = "on_demand"
