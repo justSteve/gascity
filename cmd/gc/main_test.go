@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -21,6 +22,7 @@ import (
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/runtime"
+	sessionpkg "github.com/gastownhall/gascity/internal/session"
 	"github.com/rogpeppe/go-internal/testscript"
 )
 
@@ -57,6 +59,24 @@ func configureIsolatedRuntimeEnv(t *testing.T) {
 	}
 	if os.Getenv("GC_BOOTSTRAP") == "" {
 		t.Setenv("GC_BOOTSTRAP", "skip")
+	}
+}
+
+func TestRunDoesNotLeakPersistentCityOrRigFlags(t *testing.T) {
+	prevCityFlag, prevRigFlag := cityFlag, rigFlag
+	t.Cleanup(func() {
+		cityFlag = prevCityFlag
+		rigFlag = prevRigFlag
+	})
+	cityFlag = "previous-city"
+	rigFlag = "previous-rig"
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"--city", "/tmp/leaked-city", "--rig", "leaked-rig", "version"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("run(version) = %d; stderr: %s", code, stderr.String())
+	}
+	if cityFlag != "previous-city" || rigFlag != "previous-rig" {
+		t.Fatalf("persistent flags leaked after run: city=%q rig=%q", cityFlag, rigFlag)
 	}
 }
 
@@ -661,7 +681,7 @@ func TestDoRigAddCreatesDirIfMissing(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := doRigAdd(fsys.OSFS{}, cityPath, rigPath, nil, "", "", false, false, &stdout, &stderr)
+	code := doRigAdd(fsys.OSFS{}, cityPath, rigPath, nil, "", "", "", false, false, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("doRigAdd = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -681,7 +701,7 @@ func TestDoRigAddMkdirRigPathFails(t *testing.T) {
 	f.Errors["/projects/myapp"] = fmt.Errorf("permission denied")
 
 	var stderr bytes.Buffer
-	code := doRigAdd(f, "/city", "/projects/myapp", nil, "", "", false, false, &bytes.Buffer{}, &stderr)
+	code := doRigAdd(f, "/city", "/projects/myapp", nil, "", "", "", false, false, &bytes.Buffer{}, &stderr)
 	if code != 1 {
 		t.Errorf("doRigAdd = %d, want 1", code)
 	}
@@ -695,7 +715,7 @@ func TestDoRigAddNotADirectory(t *testing.T) {
 	f.Files["/projects/myapp"] = []byte("not a dir") // file, not directory
 
 	var stderr bytes.Buffer
-	code := doRigAdd(f, "/city", "/projects/myapp", nil, "", "", false, false, &bytes.Buffer{}, &stderr)
+	code := doRigAdd(f, "/city", "/projects/myapp", nil, "", "", "", false, false, &bytes.Buffer{}, &stderr)
 	if code != 1 {
 		t.Errorf("doRigAdd = %d, want 1", code)
 	}
@@ -725,7 +745,7 @@ func TestDoRigAddWithGit(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := doRigAdd(fsys.OSFS{}, cityPath, rigPath, nil, "", "", false, false, &stdout, &stderr)
+	code := doRigAdd(fsys.OSFS{}, cityPath, rigPath, nil, "", "", "", false, false, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("doRigAdd = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -755,7 +775,7 @@ func TestDoRigAddWithoutGit(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := doRigAdd(fsys.OSFS{}, cityPath, rigPath, nil, "", "", false, false, &stdout, &stderr)
+	code := doRigAdd(fsys.OSFS{}, cityPath, rigPath, nil, "", "", "", false, false, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("doRigAdd = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -893,6 +913,95 @@ func TestResolveSessionNameWithStore(t *testing.T) {
 	want := "s-" + strings.ReplaceAll(b.ID, "/", "--")
 	if got != want {
 		t.Errorf("sessionNameFromBeadID(%q) = %q, want %q", b.ID, got, want)
+	}
+}
+
+type noBroadSessionNameLookupStore struct {
+	*beads.MemStore
+	t *testing.T
+}
+
+func (s noBroadSessionNameLookupStore) List(query beads.ListQuery) ([]beads.Bead, error) {
+	if query.Label == sessionBeadLabel && len(query.Metadata) == 0 {
+		s.t.Fatalf("session name lookup used broad session label scan: %+v", query)
+	}
+	return s.MemStore.List(query)
+}
+
+func TestFindSessionNameByTemplateUsesTargetedLookup(t *testing.T) {
+	store := noBroadSessionNameLookupStore{MemStore: beads.NewMemStore(), t: t}
+	_, err := store.Create(beads.Bead{
+		Title:  "worker-pool",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"agent_name":           "worker",
+			"template":             "worker",
+			"session_name":         "s-pool",
+			poolManagedMetadataKey: boolMetadata(true),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.Create(beads.Bead{
+		Title:  "worker",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"agent_name":   "worker",
+			"session_name": "s-worker",
+			"state":        "asleep",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := findSessionNameByTemplate(store, "worker")
+	if got != "s-worker" {
+		t.Fatalf("findSessionNameByTemplate(worker) = %q, want s-worker", got)
+	}
+}
+
+func TestResolveTemplateSessionBeadIDUsesTargetedLookup(t *testing.T) {
+	store := noBroadSessionNameLookupStore{MemStore: beads.NewMemStore(), t: t}
+	bead, err := store.Create(beads.Bead{
+		Title:  "worker",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"agent_name":   "worker",
+			"session_name": "s-worker",
+			"state":        "asleep",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	params := &agentBuildParams{
+		cityName:   "phase0-city",
+		cityPath:   t.TempDir(),
+		workspace:  &config.Workspace{Provider: "test-agent"},
+		providers:  map[string]config.ProviderSpec{"test-agent": {DisplayName: "Test Agent", Command: "true"}},
+		lookPath:   func(string) (string, error) { return filepath.Join("/usr/bin", "true"), nil },
+		fs:         fsys.OSFS{},
+		beaconTime: time.Unix(0, 0),
+		beadNames:  make(map[string]string),
+		beadStore:  store,
+		stderr:     io.Discard,
+	}
+	agentCfg := &config.Agent{
+		Name:     "worker",
+		Provider: "test-agent",
+	}
+
+	tp, err := resolveTemplate(params, agentCfg, agentCfg.QualifiedName(), nil)
+	if err != nil {
+		t.Fatalf("resolveTemplate: %v", err)
+	}
+	if got := tp.Env["GC_SESSION_ID"]; got != bead.ID {
+		t.Fatalf("GC_SESSION_ID = %q, want %q", got, bead.ID)
 	}
 }
 
@@ -1242,6 +1351,12 @@ func TestFindSessionNameByTemplate_UsesLegacyAgentLabelForPoolInstance(t *testin
 
 func TestLookupPoolSessionNames_RejectsSharedPrefixSiblingTemplates(t *testing.T) {
 	store := beads.NewMemStore()
+	cfg := &config.City{
+		Agents: []config.Agent{
+			{Name: "worker", Dir: "frontend", MaxActiveSessions: intPtr(5)},
+		},
+	}
+	cfgAgent := &cfg.Agents[0]
 	for _, bead := range []beads.Bead{
 		{
 			Title:  "worker",
@@ -1269,7 +1384,7 @@ func TestLookupPoolSessionNames_RejectsSharedPrefixSiblingTemplates(t *testing.T
 		}
 	}
 
-	got, err := lookupPoolSessionNames(store, "frontend/worker")
+	got, err := lookupPoolSessionNames(store, cfg, cfgAgent)
 	if err != nil {
 		t.Fatalf("lookupPoolSessionNames: %v", err)
 	}
@@ -1278,6 +1393,783 @@ func TestLookupPoolSessionNames_RejectsSharedPrefixSiblingTemplates(t *testing.T
 	}
 	if _, ok := got["frontend/worker-supervisor-1"]; ok {
 		t.Fatalf("lookupPoolSessionNames(frontend/worker) wrongly matched sibling template: %#v", got)
+	}
+}
+
+func TestLookupPoolSessionNames_PreservesUniqueLegacyLocalSessionNameIdentity(t *testing.T) {
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		Agents: []config.Agent{
+			{Name: "worker", Dir: "frontend", MaxActiveSessions: intPtr(5)},
+			{Name: "worker", Dir: "backend", MaxActiveSessions: intPtr(1)},
+		},
+	}
+	cfgAgent := &cfg.Agents[0]
+	if _, err := store.Create(beads.Bead{
+		Title:  "worker",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"template":     "worker",
+			"session_name": "worker-5",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := lookupPoolSessionNames(store, cfg, cfgAgent)
+	if err != nil {
+		t.Fatalf("lookupPoolSessionNames: %v", err)
+	}
+	if got["frontend/worker-5"] != "worker-5" {
+		t.Fatalf("lookupPoolSessionNames(frontend/worker) = %#v, want unique local session_name to recover worker-5", got)
+	}
+}
+
+func TestLookupPoolSessionNames_DoesNotClaimAmbiguousLegacyLocalSessionNameIdentity(t *testing.T) {
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		Agents: []config.Agent{
+			{Name: "worker", Dir: "frontend", MaxActiveSessions: intPtr(5)},
+			{Name: "worker", Dir: "backend", MaxActiveSessions: intPtr(5)},
+		},
+	}
+	cfgAgent := &cfg.Agents[0]
+	if _, err := store.Create(beads.Bead{
+		Title:  "worker",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"template":     "worker",
+			"session_name": "worker-5",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := lookupPoolSessionNames(store, cfg, cfgAgent)
+	if err != nil {
+		t.Fatalf("lookupPoolSessionNames: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("lookupPoolSessionNames(frontend/worker) = %#v, want ambiguous local session_name to stay unresolved", got)
+	}
+}
+
+func TestLookupPoolSessionNames_PreservesLegacyCommonNameSessionNameIdentity(t *testing.T) {
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		Agents: []config.Agent{
+			{Name: "worker", Dir: "frontend", MaxActiveSessions: intPtr(5)},
+			{Name: "worker", Dir: "backend", MaxActiveSessions: intPtr(1)},
+		},
+	}
+	cfgAgent := &cfg.Agents[0]
+	if _, err := store.Create(beads.Bead{
+		Title:  "worker",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"common_name":  "worker",
+			"session_name": "worker-5",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := lookupPoolSessionNames(store, cfg, cfgAgent)
+	if err != nil {
+		t.Fatalf("lookupPoolSessionNames: %v", err)
+	}
+	if got["frontend/worker-5"] != "worker-5" {
+		t.Fatalf("lookupPoolSessionNames(frontend/worker) = %#v, want common_name-only legacy session_name to recover worker-5", got)
+	}
+}
+
+func TestLookupPoolSessionNames_DoesNotRecoverSessionNameSlotWhenAliasPresent(t *testing.T) {
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		Agents: []config.Agent{
+			{Name: "worker", Dir: "frontend", MaxActiveSessions: intPtr(5)},
+			{Name: "worker", Dir: "backend", MaxActiveSessions: intPtr(1)},
+		},
+	}
+	cfgAgent := &cfg.Agents[0]
+	if _, err := store.Create(beads.Bead{
+		Title:  "worker",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"template":     "frontend/worker",
+			"alias":        "stale-worker-alias",
+			"session_name": "worker-5",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := lookupPoolSessionNames(store, cfg, cfgAgent)
+	if err != nil {
+		t.Fatalf("lookupPoolSessionNames: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("lookupPoolSessionNames(frontend/worker) = %#v, want alias-bearing bead to stay unresolved", got)
+	}
+}
+
+type lookupPoolSessionNameCandidatesStore struct {
+	beads.Store
+	beads []beads.Bead
+}
+
+func (s lookupPoolSessionNameCandidatesStore) List(query beads.ListQuery) ([]beads.Bead, error) {
+	var result []beads.Bead
+	for _, bead := range s.beads {
+		if query.Label != "" {
+			matched := false
+			for _, label := range bead.Labels {
+				if label == query.Label {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				continue
+			}
+		}
+		result = append(result, bead)
+	}
+	return result, nil
+}
+
+func TestLookupPoolSessionNames_DoesNotRecoverOwnedPoolSessionNameSlot(t *testing.T) {
+	cfg := &config.City{
+		Agents: []config.Agent{
+			{Name: "worker", Dir: "frontend", MaxActiveSessions: intPtr(5)},
+			{Name: "worker", Dir: "backend", MaxActiveSessions: intPtr(1)},
+		},
+	}
+	cfgAgent := &cfg.Agents[0]
+	store := lookupPoolSessionNameCandidatesStore{
+		beads: []beads.Bead{
+			{
+				ID:     "5",
+				Title:  "worker",
+				Type:   sessionBeadType,
+				Status: "open",
+				Labels: []string{sessionBeadLabel},
+				Metadata: map[string]string{
+					"template":     "frontend/worker",
+					"session_name": PoolSessionName("frontend/worker", "5"),
+				},
+			},
+		},
+	}
+
+	got, err := lookupPoolSessionNames(store, cfg, cfgAgent)
+	if err != nil {
+		t.Fatalf("lookupPoolSessionNames: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("lookupPoolSessionNames(frontend/worker) = %#v, want bead-owned pool session_name to stay unresolved", got)
+	}
+}
+
+func TestLookupPoolSessionNames_PrefersStampedBeadOverLegacyCollision(t *testing.T) {
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		Agents: []config.Agent{
+			{Name: "worker", Dir: "frontend", MaxActiveSessions: intPtr(5)},
+			{Name: "worker", Dir: "backend", MaxActiveSessions: intPtr(1)},
+		},
+	}
+	cfgAgent := &cfg.Agents[0]
+	for _, bead := range []beads.Bead{
+		{
+			Title:  "legacy worker",
+			Type:   sessionBeadType,
+			Labels: []string{sessionBeadLabel},
+			Metadata: map[string]string{
+				"common_name":  "worker",
+				"session_name": "worker-7",
+			},
+		},
+		{
+			Title:  "live worker",
+			Type:   sessionBeadType,
+			Labels: []string{sessionBeadLabel},
+			Metadata: map[string]string{
+				"template":     "frontend/worker",
+				"session_name": "s-live-worker-7",
+				"agent_name":   "frontend/worker-7",
+				"pool_slot":    "7",
+			},
+		},
+	} {
+		if _, err := store.Create(bead); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := lookupPoolSessionNames(store, cfg, cfgAgent)
+	if err != nil {
+		t.Fatalf("lookupPoolSessionNames: %v", err)
+	}
+	if got["frontend/worker-7"] != "s-live-worker-7" {
+		t.Fatalf("lookupPoolSessionNames(frontend/worker) = %#v, want stamped bead to win the collision", got)
+	}
+}
+
+func TestLookupPoolSessionNames_DropsAmbiguousLegacyCollision(t *testing.T) {
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		Agents: []config.Agent{
+			{Name: "worker", Dir: "frontend", MaxActiveSessions: intPtr(5)},
+			{Name: "worker", Dir: "backend", MaxActiveSessions: intPtr(1)},
+		},
+	}
+	cfgAgent := &cfg.Agents[0]
+	for _, bead := range []beads.Bead{
+		{
+			Title:  "legacy worker a",
+			Type:   sessionBeadType,
+			Labels: []string{sessionBeadLabel},
+			Metadata: map[string]string{
+				"common_name":  "worker",
+				"session_name": "legacy-worker-a",
+				"alias":        "frontend/worker-7",
+			},
+		},
+		{
+			Title:  "legacy worker b",
+			Type:   sessionBeadType,
+			Labels: []string{sessionBeadLabel},
+			Metadata: map[string]string{
+				"common_name":  "worker",
+				"session_name": "legacy-worker-b",
+				"alias":        "frontend/worker-7",
+			},
+		},
+	} {
+		if _, err := store.Create(bead); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := lookupPoolSessionNames(store, cfg, cfgAgent)
+	if err != nil {
+		t.Fatalf("lookupPoolSessionNames: %v", err)
+	}
+	if _, ok := got["frontend/worker-7"]; ok {
+		t.Fatalf("lookupPoolSessionNames(frontend/worker) = %#v, want ambiguous legacy collision dropped", got)
+	}
+}
+
+func TestLookupPoolSessionNames_StampedBeadOverridesEarlierAmbiguousLegacyCollision(t *testing.T) {
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		Agents: []config.Agent{
+			{Name: "worker", Dir: "frontend", MaxActiveSessions: intPtr(5)},
+			{Name: "worker", Dir: "backend", MaxActiveSessions: intPtr(1)},
+		},
+	}
+	cfgAgent := &cfg.Agents[0]
+	for _, bead := range []beads.Bead{
+		{
+			Title:  "legacy worker a",
+			Type:   sessionBeadType,
+			Labels: []string{sessionBeadLabel},
+			Metadata: map[string]string{
+				"common_name":  "worker",
+				"session_name": "worker-7",
+			},
+		},
+		{
+			Title:  "legacy worker b",
+			Type:   sessionBeadType,
+			Labels: []string{sessionBeadLabel},
+			Metadata: map[string]string{
+				"common_name":  "worker",
+				"session_name": "legacy-worker-b",
+				"alias":        "frontend/worker-7",
+			},
+		},
+		{
+			Title:  "live worker",
+			Type:   sessionBeadType,
+			Labels: []string{sessionBeadLabel},
+			Metadata: map[string]string{
+				"template":     "frontend/worker",
+				"session_name": "s-live-worker-7",
+				"agent_name":   "frontend/worker-7",
+				"pool_slot":    "7",
+			},
+		},
+	} {
+		if _, err := store.Create(bead); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := lookupPoolSessionNames(store, cfg, cfgAgent)
+	if err != nil {
+		t.Fatalf("lookupPoolSessionNames: %v", err)
+	}
+	if got["frontend/worker-7"] != "s-live-worker-7" {
+		t.Fatalf("lookupPoolSessionNames(frontend/worker) = %#v, want stamped bead to override earlier ambiguous legacy collision", got)
+	}
+}
+
+func TestLookupPoolSessionNames_PrefersConcreteStampedBeadOverPoolSlotOnlyDuplicate(t *testing.T) {
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		Agents: []config.Agent{
+			{Name: "worker", Dir: "frontend", MaxActiveSessions: intPtr(5)},
+		},
+	}
+	cfgAgent := &cfg.Agents[0]
+	for _, bead := range []beads.Bead{
+		{
+			Title:  "stale duplicate",
+			Type:   sessionBeadType,
+			Labels: []string{sessionBeadLabel},
+			Metadata: map[string]string{
+				"template":     "frontend/worker",
+				"session_name": "s-stale-duplicate",
+				"pool_slot":    "7",
+			},
+		},
+		{
+			Title:  "live worker",
+			Type:   sessionBeadType,
+			Labels: []string{sessionBeadLabel},
+			Metadata: map[string]string{
+				"template":     "frontend/worker",
+				"session_name": "s-live-worker-7",
+				"agent_name":   "frontend/worker-7",
+				"pool_slot":    "7",
+			},
+		},
+	} {
+		if _, err := store.Create(bead); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := lookupPoolSessionNames(store, cfg, cfgAgent)
+	if err != nil {
+		t.Fatalf("lookupPoolSessionNames: %v", err)
+	}
+	if got["frontend/worker-7"] != "s-live-worker-7" {
+		t.Fatalf("lookupPoolSessionNames(frontend/worker) = %#v, want concrete stamped bead to beat pool_slot-only duplicate", got)
+	}
+}
+
+func TestLookupPoolSessionNames_PrefersActiveStampedBeadOverCreatingScoreTie(t *testing.T) {
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		Agents: []config.Agent{
+			{Name: "worker", Dir: "frontend", MaxActiveSessions: intPtr(5)},
+		},
+	}
+	cfgAgent := &cfg.Agents[0]
+	for _, bead := range []beads.Bead{
+		{
+			Title:  "creating duplicate",
+			Type:   sessionBeadType,
+			Labels: []string{sessionBeadLabel},
+			Metadata: map[string]string{
+				"template":     "frontend/worker",
+				"session_name": "a-creating-worker-5",
+				"pool_slot":    "5",
+				"state":        "creating",
+			},
+		},
+		{
+			Title:  "active worker",
+			Type:   sessionBeadType,
+			Labels: []string{sessionBeadLabel},
+			Metadata: map[string]string{
+				"template":     "frontend/worker",
+				"session_name": "z-active-worker-5",
+				"pool_slot":    "5",
+				"state":        "awake",
+			},
+		},
+	} {
+		if _, err := store.Create(bead); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := lookupPoolSessionNames(store, cfg, cfgAgent)
+	if err != nil {
+		t.Fatalf("lookupPoolSessionNames: %v", err)
+	}
+	if got["frontend/worker-5"] != "z-active-worker-5" {
+		t.Fatalf("lookupPoolSessionNames(frontend/worker) = %#v, want active stamped bead to beat creating duplicate", got)
+	}
+}
+
+func TestLookupPoolSessionNames_IgnoresFailedCreateIdentity(t *testing.T) {
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		Agents: []config.Agent{
+			{Name: "worker", Dir: "frontend", MaxActiveSessions: intPtr(5)},
+		},
+	}
+	cfgAgent := &cfg.Agents[0]
+	for _, bead := range []beads.Bead{
+		{
+			Title:  "failed create worker",
+			Type:   sessionBeadType,
+			Labels: []string{sessionBeadLabel},
+			Metadata: map[string]string{
+				"template":     "frontend/worker",
+				"session_name": "stale-worker-1",
+				"agent_name":   "frontend/worker-1",
+				"alias":        "frontend/worker-1",
+				"pool_slot":    "1",
+				"state":        string(sessionpkg.StateFailedCreate),
+			},
+		},
+		{
+			Title:  "fresh worker",
+			Type:   sessionBeadType,
+			Labels: []string{sessionBeadLabel},
+			Metadata: map[string]string{
+				"template":     "frontend/worker",
+				"session_name": "fresh-worker-1",
+				"agent_name":   "frontend/worker-1",
+				"pool_slot":    "1",
+				"state":        "creating",
+			},
+		},
+	} {
+		if _, err := store.Create(bead); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := lookupPoolSessionNames(store, cfg, cfgAgent)
+	if err != nil {
+		t.Fatalf("lookupPoolSessionNames: %v", err)
+	}
+	if got["frontend/worker-1"] != "fresh-worker-1" {
+		t.Fatalf("lookupPoolSessionNames(frontend/worker) = %#v, want failed-create identity ignored", got)
+	}
+}
+
+func TestResolvePoolSessionRefs_KeepsLowerScoredFallbackCandidate(t *testing.T) {
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		Agents: []config.Agent{
+			{Name: "worker", Dir: "frontend", MaxActiveSessions: intPtr(10)},
+		},
+	}
+	agentCfg := cfg.Agents[0]
+	for _, bead := range []beads.Bead{
+		{
+			Title:  "stale duplicate",
+			Type:   sessionBeadType,
+			Labels: []string{sessionBeadLabel},
+			Metadata: map[string]string{
+				"template":     "frontend/worker",
+				"session_name": "s-stale-worker-7",
+				"pool_slot":    "7",
+			},
+		},
+		{
+			Title:  "live legacy",
+			Type:   sessionBeadType,
+			Labels: []string{sessionBeadLabel},
+			Metadata: map[string]string{
+				"common_name":  "worker",
+				"session_name": "worker-7",
+				"alias":        "frontend/worker-7",
+			},
+		},
+	} {
+		if _, err := store.Create(bead); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	refs := resolvePoolSessionRefs(store, cfg, agentCfg.Name, agentCfg.Dir, scaleParamsFor(&agentCfg), &agentCfg, "test-city", "", runtime.NewFake(), io.Discard)
+	var got []string
+	for _, ref := range refs {
+		if ref.qualifiedInstance == "frontend/worker-7" {
+			got = append(got, ref.sessionName)
+		}
+	}
+	wantPrefix := []string{"s-stale-worker-7", "worker-7"}
+	if len(got) < len(wantPrefix) || !reflect.DeepEqual(got[:len(wantPrefix)], wantPrefix) {
+		t.Fatalf("resolvePoolSessionRefs(frontend/worker-7) = %v, want prefix %v", got, wantPrefix)
+	}
+}
+
+func TestSelectRunningPoolSessionRefs_PrefersLiveFallbackCandidate(t *testing.T) {
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		Agents: []config.Agent{
+			{Name: "worker", Dir: "frontend", MaxActiveSessions: intPtr(10)},
+		},
+	}
+	agentCfg := cfg.Agents[0]
+	for _, bead := range []beads.Bead{
+		{
+			Title:  "stale duplicate",
+			Type:   sessionBeadType,
+			Labels: []string{sessionBeadLabel},
+			Metadata: map[string]string{
+				"template":     "frontend/worker",
+				"session_name": "s-stale-worker-7",
+				"pool_slot":    "7",
+			},
+		},
+		{
+			Title:  "live legacy",
+			Type:   sessionBeadType,
+			Labels: []string{sessionBeadLabel},
+			Metadata: map[string]string{
+				"common_name":  "worker",
+				"session_name": "worker-7",
+				"alias":        "frontend/worker-7",
+			},
+		},
+	} {
+		if _, err := store.Create(bead); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sp := runtime.NewFake()
+	if err := sp.Start(context.Background(), "worker-7", runtime.Config{Command: "echo"}); err != nil {
+		t.Fatal(err)
+	}
+
+	refs, err := selectRunningPoolSessionRefs(store, sp, cfg, resolvePoolSessionRefs(store, cfg, agentCfg.Name, agentCfg.Dir, scaleParamsFor(&agentCfg), &agentCfg, "test-city", "", sp, io.Discard))
+	if err != nil {
+		t.Fatalf("selectRunningPoolSessionRefs: %v", err)
+	}
+	if len(refs) != 1 {
+		t.Fatalf("selectRunningPoolSessionRefs() returned %d refs, want 1: %#v", len(refs), refs)
+	}
+	if refs[0].qualifiedInstance != "frontend/worker-7" || refs[0].sessionName != "worker-7" {
+		t.Fatalf("selectRunningPoolSessionRefs() = %#v, want frontend/worker-7 -> worker-7", refs)
+	}
+}
+
+func TestSelectRunningPoolSessionRefs_ReturnsAllLiveCandidatesForLogicalInstance(t *testing.T) {
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		Agents: []config.Agent{
+			{Name: "worker", Dir: "frontend", MaxActiveSessions: intPtr(10)},
+		},
+	}
+	agentCfg := cfg.Agents[0]
+	for _, bead := range []beads.Bead{
+		{
+			Title:  "stale duplicate",
+			Type:   sessionBeadType,
+			Labels: []string{sessionBeadLabel},
+			Metadata: map[string]string{
+				"template":     "frontend/worker",
+				"session_name": "s-stale-worker-7",
+				"pool_slot":    "7",
+			},
+		},
+		{
+			Title:  "live legacy",
+			Type:   sessionBeadType,
+			Labels: []string{sessionBeadLabel},
+			Metadata: map[string]string{
+				"common_name":  "worker",
+				"session_name": "worker-7",
+				"alias":        "frontend/worker-7",
+			},
+		},
+	} {
+		if _, err := store.Create(bead); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sp := runtime.NewFake()
+	for _, sessionName := range []string{"s-stale-worker-7", "worker-7"} {
+		if err := sp.Start(context.Background(), sessionName, runtime.Config{Command: "echo"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	refs, err := selectRunningPoolSessionRefs(store, sp, cfg, resolvePoolSessionRefs(store, cfg, agentCfg.Name, agentCfg.Dir, scaleParamsFor(&agentCfg), &agentCfg, "test-city", "", sp, io.Discard))
+	if err != nil {
+		t.Fatalf("selectRunningPoolSessionRefs: %v", err)
+	}
+	got := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		if ref.qualifiedInstance == "frontend/worker-7" {
+			got = append(got, ref.sessionName)
+		}
+	}
+	want := []string{"s-stale-worker-7", "worker-7"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("selectRunningPoolSessionRefs(frontend/worker-7) = %v, want %v", got, want)
+	}
+}
+
+func TestSelectRunningPoolSessionRefs_ReportsConcreteSessionOnProbeFailure(t *testing.T) {
+	cfg := &config.City{
+		Agents: []config.Agent{
+			{Name: "worker", Dir: "frontend", MaxActiveSessions: intPtr(10)},
+		},
+	}
+	refs := []poolSessionRef{{
+		qualifiedInstance: "frontend/worker-7",
+		sessionName:       "custom-worker-7",
+	}}
+
+	_, err := selectRunningPoolSessionRefs(nil, nil, cfg, refs)
+	if err == nil {
+		t.Fatal("selectRunningPoolSessionRefs() unexpectedly succeeded")
+	}
+	if !strings.Contains(err.Error(), "custom-worker-7") {
+		t.Fatalf("selectRunningPoolSessionRefs() error = %q, want concrete session name", err)
+	}
+}
+
+func TestResolvePoolSessionRefs_ResolvesBindingQualifiedNamepoolAlias(t *testing.T) {
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		Agents: []config.Agent{
+			{
+				Name:          "worker",
+				Dir:           "frontend",
+				BindingName:   "ops",
+				NamepoolNames: []string{"furiosa", "nux"},
+			},
+		},
+	}
+	agentCfg := cfg.Agents[0]
+	if _, err := store.Create(beads.Bead{
+		Title:  "bound themed pool instance",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"template":     "frontend/ops.worker",
+			"session_name": "ops-furiosa-session",
+			"alias":        "frontend/ops.furiosa",
+			"state":        "awake",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	refs := resolvePoolSessionRefs(store, cfg, agentCfg.Name, agentCfg.Dir, scaleParamsFor(&agentCfg), &agentCfg, "test-city", "", runtime.NewFake(), io.Discard)
+	if len(refs) != 1 {
+		t.Fatalf("resolvePoolSessionRefs() returned %d refs, want 1: %#v", len(refs), refs)
+	}
+	if refs[0].qualifiedInstance != "frontend/ops.furiosa" || refs[0].sessionName != "ops-furiosa-session" {
+		t.Fatalf("resolvePoolSessionRefs() = %#v, want frontend/ops.furiosa -> ops-furiosa-session", refs)
+	}
+}
+
+func TestResolvePoolSessionRefs_UsesBoundTemplatePoolSlotForCustomSessionName(t *testing.T) {
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		Agents: []config.Agent{
+			{
+				Name:          "worker",
+				Dir:           "frontend",
+				BindingName:   "ops",
+				NamepoolNames: []string{"furiosa", "nux"},
+			},
+		},
+	}
+	agentCfg := cfg.Agents[0]
+	if _, err := store.Create(beads.Bead{
+		Title:  "bound themed pool instance",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"template":     "frontend/ops.worker",
+			"session_name": "custom-ops-furiosa",
+			"pool_slot":    "1",
+			"state":        "awake",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	refs := resolvePoolSessionRefs(store, cfg, agentCfg.Name, agentCfg.Dir, scaleParamsFor(&agentCfg), &agentCfg, "test-city", "", runtime.NewFake(), io.Discard)
+	if len(refs) != 1 {
+		t.Fatalf("resolvePoolSessionRefs() returned %d refs, want 1: %#v", len(refs), refs)
+	}
+	if refs[0].qualifiedInstance != "frontend/ops.furiosa" || refs[0].sessionName != "custom-ops-furiosa" {
+		t.Fatalf("resolvePoolSessionRefs() = %#v, want frontend/ops.furiosa -> custom-ops-furiosa", refs)
+	}
+}
+
+func TestResolvePoolSessionRefs_RewritesTemplateIdentityAgentNameFromPoolSlot(t *testing.T) {
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		Agents: []config.Agent{
+			{Name: "worker", Dir: "frontend", MaxActiveSessions: intPtr(10)},
+		},
+	}
+	agentCfg := cfg.Agents[0]
+	if _, err := store.Create(beads.Bead{
+		Title:  "legacy pool instance",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"template":     "frontend/worker",
+			"agent_name":   "frontend/worker",
+			"session_name": "custom-worker-7",
+			"pool_slot":    "7",
+			"state":        "awake",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	refs := resolvePoolSessionRefs(store, cfg, agentCfg.Name, agentCfg.Dir, scaleParamsFor(&agentCfg), &agentCfg, "test-city", "", runtime.NewFake(), io.Discard)
+	for _, ref := range refs {
+		if ref.sessionName == "custom-worker-7" {
+			if ref.qualifiedInstance != "frontend/worker-7" {
+				t.Fatalf("resolvePoolSessionRefs() custom ref = %#v, want frontend/worker-7 -> custom-worker-7", ref)
+			}
+			return
+		}
+	}
+	t.Fatalf("resolvePoolSessionRefs() = %#v, want custom-worker-7 candidate keyed by frontend/worker-7", refs)
+}
+
+func TestResolvePoolSessionRefs_DoesNotRecoverOutOfBoundsAliasOnlyBoundedPoolIdentity(t *testing.T) {
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		Agents: []config.Agent{
+			{Name: "worker", Dir: "frontend", MaxActiveSessions: intPtr(5)},
+		},
+	}
+	agentCfg := cfg.Agents[0]
+	if _, err := store.Create(beads.Bead{
+		Title:  "stale out-of-bounds pool instance",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"template":     "frontend/worker",
+			"alias":        "frontend/worker-7",
+			"session_name": "custom-worker-7",
+			"state":        "awake",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	refs := resolvePoolSessionRefs(store, cfg, agentCfg.Name, agentCfg.Dir, scaleParamsFor(&agentCfg), &agentCfg, "test-city", "", runtime.NewFake(), io.Discard)
+	for _, ref := range refs {
+		if ref.sessionName == "custom-worker-7" {
+			t.Fatalf("resolvePoolSessionRefs() unexpectedly kept out-of-bounds ref %#v", ref)
+		}
 	}
 }
 
@@ -1396,7 +2288,7 @@ func TestDoInitSuccess(t *testing.T) {
 	// No pre-existing files — doInit creates everything from scratch.
 
 	var stdout, stderr bytes.Buffer
-	code := doInit(f, "/bright-lights", defaultWizardConfig(), "", &stdout, &stderr)
+	code := doInit(f, "/bright-lights", defaultWizardConfig(), "", &stdout, &stderr, false)
 	if code != 0 {
 		t.Fatalf("doInit = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -1487,7 +2379,7 @@ func TestDoInitWritesExpectedTOML(t *testing.T) {
 	f := fsys.NewFake()
 
 	var stdout, stderr bytes.Buffer
-	code := doInit(f, "/bright-lights", defaultWizardConfig(), "", &stdout, &stderr)
+	code := doInit(f, "/bright-lights", defaultWizardConfig(), "", &stdout, &stderr, false)
 	if code != 0 {
 		t.Fatalf("doInit = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -1525,7 +2417,7 @@ func TestDoInitGastownWritesCanonicalPackV2Shape(t *testing.T) {
 	f := fsys.NewFake()
 
 	var stdout, stderr bytes.Buffer
-	code := doInit(f, "/bright-lights", wizardConfig{configName: "gastown", provider: "claude"}, "", &stdout, &stderr)
+	code := doInit(f, "/bright-lights", wizardConfig{configName: "gastown", provider: "claude"}, "", &stdout, &stderr, false)
 	if code != 0 {
 		t.Fatalf("doInit = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -1563,7 +2455,7 @@ func TestDoInitAlreadyInitialized(t *testing.T) {
 	markFakeCityScaffold(f, "/city")
 
 	var stderr bytes.Buffer
-	code := doInit(f, "/city", defaultWizardConfig(), "", &bytes.Buffer{}, &stderr)
+	code := doInit(f, "/city", defaultWizardConfig(), "", &bytes.Buffer{}, &stderr, false)
 	if code != initExitAlreadyInitialized {
 		t.Errorf("doInit = %d, want %d", code, initExitAlreadyInitialized)
 	}
@@ -1589,7 +2481,7 @@ func TestDoInitBootstrapsExistingCityToml(t *testing.T) {
 	f.Files[filepath.Join("/city", "city.toml")] = original
 
 	var stdout, stderr bytes.Buffer
-	code := doInit(f, "/city", defaultWizardConfig(), "", &stdout, &stderr)
+	code := doInit(f, "/city", defaultWizardConfig(), "", &stdout, &stderr, false)
 	if code != 0 {
 		t.Errorf("doInit = %d, want 0; stderr=%q", code, stderr.String())
 	}
@@ -1615,7 +2507,7 @@ func TestDoInitBootstrapWithNameOverride(t *testing.T) {
 	f.Files[filepath.Join("/city", "city.toml")] = []byte("[workspace]\nname = \"old-name\"\n")
 
 	var stdout, stderr bytes.Buffer
-	code := doInit(f, "/city", defaultWizardConfig(), "new-name", &stdout, &stderr)
+	code := doInit(f, "/city", defaultWizardConfig(), "new-name", &stdout, &stderr, false)
 	if code != 0 {
 		t.Errorf("doInit = %d, want 0; stderr=%q", code, stderr.String())
 	}
@@ -1637,7 +2529,7 @@ func TestDoInitMkdirGCFails(t *testing.T) {
 	f.Errors[filepath.Join("/city", ".gc")] = fmt.Errorf("permission denied")
 
 	var stderr bytes.Buffer
-	code := doInit(f, "/city", defaultWizardConfig(), "", &bytes.Buffer{}, &stderr)
+	code := doInit(f, "/city", defaultWizardConfig(), "", &bytes.Buffer{}, &stderr, false)
 	if code != 1 {
 		t.Errorf("doInit = %d, want 1", code)
 	}
@@ -1651,7 +2543,7 @@ func TestDoInitWriteFails(t *testing.T) {
 	f.Errors[filepath.Join("/city", "city.toml")] = fmt.Errorf("read-only fs")
 
 	var stderr bytes.Buffer
-	code := doInit(f, "/city", defaultWizardConfig(), "", &bytes.Buffer{}, &stderr)
+	code := doInit(f, "/city", defaultWizardConfig(), "", &bytes.Buffer{}, &stderr, false)
 	if code != 1 {
 		t.Errorf("doInit = %d, want 1", code)
 	}
@@ -1665,7 +2557,7 @@ func TestDoInitWriteFails(t *testing.T) {
 func TestDoInitCreatesSettings(t *testing.T) {
 	f := fsys.NewFake()
 	var stdout, stderr bytes.Buffer
-	code := doInit(f, "/bright-lights", defaultWizardConfig(), "", &stdout, &stderr)
+	code := doInit(f, "/bright-lights", defaultWizardConfig(), "", &stdout, &stderr, false)
 	if code != 0 {
 		t.Fatalf("doInit = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -1685,7 +2577,7 @@ func TestDoInitCreatesSettings(t *testing.T) {
 func TestDoInitSettingsIsValidJSON(t *testing.T) {
 	f := fsys.NewFake()
 	var stdout, stderr bytes.Buffer
-	code := doInit(f, "/bright-lights", defaultWizardConfig(), "", &stdout, &stderr)
+	code := doInit(f, "/bright-lights", defaultWizardConfig(), "", &stdout, &stderr, false)
 	if code != 0 {
 		t.Fatalf("doInit = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -1706,7 +2598,7 @@ func TestDoInitSettingsIsValidJSON(t *testing.T) {
 	if !ok {
 		t.Fatal("settings.json 'hooks' is not an object")
 	}
-	for _, event := range []string{"SessionStart", "PreCompact", "UserPromptSubmit", "Stop"} {
+	for _, event := range []string{"SessionStart", "PreCompact", "UserPromptSubmit"} {
 		if _, ok := hookMap[event]; !ok {
 			t.Errorf("settings.json missing hook event %q", event)
 		}
@@ -1959,8 +2851,8 @@ func TestRunWizardTutorialAliasMapsToMinimal(t *testing.T) {
 }
 
 func TestRunWizardSelectCursorByNumber(t *testing.T) {
-	// Cursor is #4 in the order.
-	stdin := strings.NewReader("\n4\n")
+	// Cursor is #5 in the order.
+	stdin := strings.NewReader("\n5\n")
 	var stdout bytes.Buffer
 	wiz := runWizard(stdin, &stdout)
 
@@ -2027,7 +2919,7 @@ func TestDoInitWithWizardConfig(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := doInit(f, "/bright-lights", wiz, "", &stdout, &stderr)
+	code := doInit(f, "/bright-lights", wiz, "", &stdout, &stderr, false)
 	if code != 0 {
 		t.Fatalf("doInit = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -2081,7 +2973,7 @@ func TestDoInitWithCustomCommand(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := doInit(f, "/bright-lights", wiz, "", &stdout, &stderr)
+	code := doInit(f, "/bright-lights", wiz, "", &stdout, &stderr, false)
 	if code != 0 {
 		t.Fatalf("doInit = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -2117,7 +3009,7 @@ func TestDoInitWithGastownTemplate(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := doInit(f, "/bright-lights", wiz, "", &stdout, &stderr)
+	code := doInit(f, "/bright-lights", wiz, "", &stdout, &stderr, false)
 	if code != 0 {
 		t.Fatalf("doInit = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -2165,7 +3057,7 @@ func TestDoInitWithCustomTemplate(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := doInit(f, "/my-city", wiz, "", &stdout, &stderr)
+	code := doInit(f, "/my-city", wiz, "", &stdout, &stderr, false)
 	if code != 0 {
 		t.Fatalf("doInit = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -2202,7 +3094,7 @@ func TestDoInitWithProviderFlagAndBootstrapProfile(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := doInit(f, "/hosted-city", wiz, "", &stdout, &stderr)
+	code := doInit(f, "/hosted-city", wiz, "", &stdout, &stderr, false)
 	if code != 0 {
 		t.Fatalf("doInit = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -2246,7 +3138,7 @@ func TestDoInitWithOpenCodeProviderInstallsWorkspaceHooks(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := doInit(f, "/open-city", wiz, "", &stdout, &stderr)
+	code := doInit(f, "/open-city", wiz, "", &stdout, &stderr, false)
 	if code != 0 {
 		t.Fatalf("doInit = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -2267,6 +3159,35 @@ func TestDoInitWithOpenCodeProviderInstallsWorkspaceHooks(t *testing.T) {
 	}
 }
 
+func TestDoInitWithKiroProviderInstallsWorkspaceHooks(t *testing.T) {
+	f := fsys.NewFake()
+	wiz := wizardConfig{
+		configName: "minimal",
+		provider:   "kiro",
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doInit(f, "/kiro-city", wiz, "", &stdout, &stderr, false)
+	if code != 0 {
+		t.Fatalf("doInit = %d, want 0; stderr: %s", code, stderr.String())
+	}
+
+	data := f.Files[filepath.Join("/kiro-city", "city.toml")]
+	cfg, err := config.Parse(data)
+	if err != nil {
+		t.Fatalf("parsing written config: %v", err)
+	}
+	if cfg.Workspace.Provider != "kiro" {
+		t.Errorf("Workspace.Provider = %q, want %q", cfg.Workspace.Provider, "kiro")
+	}
+	if len(cfg.Workspace.InstallAgentHooks) != 1 || cfg.Workspace.InstallAgentHooks[0] != "kiro" {
+		t.Errorf("Workspace.InstallAgentHooks = %v, want [kiro]", cfg.Workspace.InstallAgentHooks)
+	}
+	if !strings.Contains(string(data), "install_agent_hooks") {
+		t.Errorf("city.toml missing install_agent_hooks:\n%s", data)
+	}
+}
+
 func TestDoInitWithClaudeProviderLeavesWorkspaceHooksEmpty(t *testing.T) {
 	f := fsys.NewFake()
 	wiz := wizardConfig{
@@ -2275,7 +3196,7 @@ func TestDoInitWithClaudeProviderLeavesWorkspaceHooksEmpty(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := doInit(f, "/claude-city", wiz, "", &stdout, &stderr)
+	code := doInit(f, "/claude-city", wiz, "", &stdout, &stderr, false)
 	if code != 0 {
 		t.Fatalf("doInit = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -2381,20 +3302,36 @@ scale_check = "echo 3"
 		t.Errorf("ResolvedWorkspaceName = %q, want %q (should be overridden)", cfg.ResolvedWorkspaceName, "bright-lights")
 	}
 	explicit := explicitAgents(cfg.Agents)
-	if len(explicit) != 2 {
-		t.Fatalf("len(explicitAgents) = %d, want 2", len(explicit))
+	if len(explicit) != 3 {
+		t.Fatalf("len(explicitAgents) = %d, want 3", len(explicit))
 	}
-	if explicit[1].Name != "worker" {
-		t.Errorf("explicitAgents[1].Name = %q, want %q", explicit[1].Name, "worker")
+	explicitByName := make(map[string]config.Agent, len(explicit))
+	for _, agent := range explicit {
+		explicitByName[agent.Name] = agent
 	}
-	if explicit[1].MaxActiveSessions == nil {
-		t.Fatal("explicitAgents[1].MaxActiveSessions is nil, want non-nil")
+	mayor, ok := explicitByName["mayor"]
+	if !ok {
+		t.Fatalf("explicitAgents missing mayor: %+v", explicit)
 	}
-	if *explicit[1].MaxActiveSessions != 5 {
-		t.Errorf("explicitAgents[1].MaxActiveSessions = %d, want 5", *explicit[1].MaxActiveSessions)
+	worker, ok := explicitByName["worker"]
+	if !ok {
+		t.Fatalf("explicitAgents missing worker: %+v", explicit)
 	}
-	if !strings.HasSuffix(explicit[0].PromptTemplate, filepath.Join("agents", "mayor", "prompt.template.md")) {
-		t.Errorf("explicitAgents[0].PromptTemplate = %q, want suffix %q", explicit[0].PromptTemplate, filepath.Join("agents", "mayor", "prompt.template.md"))
+	dog, ok := explicitByName["dog"]
+	if !ok {
+		t.Fatalf("explicitAgents missing builtin maintenance dog agent: %+v", explicit)
+	}
+	if worker.MaxActiveSessions == nil {
+		t.Fatal("worker.MaxActiveSessions is nil, want non-nil")
+	}
+	if *worker.MaxActiveSessions != 5 {
+		t.Errorf("worker.MaxActiveSessions = %d, want 5", *worker.MaxActiveSessions)
+	}
+	if !strings.HasSuffix(mayor.PromptTemplate, filepath.Join("agents", "mayor", "prompt.template.md")) {
+		t.Errorf("mayor.PromptTemplate = %q, want suffix %q", mayor.PromptTemplate, filepath.Join("agents", "mayor", "prompt.template.md"))
+	}
+	if !strings.HasSuffix(dog.PromptTemplate, filepath.Join(".gc", "system", "packs", "maintenance", "agents", "dog", "prompt.template.md")) {
+		t.Errorf("dog.PromptTemplate = %q, want maintenance dog prompt", dog.PromptTemplate)
 	}
 
 	packData, err := os.ReadFile(filepath.Join(cityPath, "pack.toml"))
@@ -2481,6 +3418,193 @@ func TestCmdInitFromTOMLFileAlreadyInitializedByCityToml(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "already initialized") {
 		t.Errorf("stderr = %q, want 'already initialized'", stderr.String())
+	}
+}
+
+func TestCmdInitFromTOMLFilePreservesExistingFiles(t *testing.T) {
+	configureIsolatedRuntimeEnv(t)
+
+	dir := t.TempDir()
+	cityPath := filepath.Join(dir, "city")
+	if err := os.MkdirAll(filepath.Join(cityPath, "agents", "mayor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	preExistingPack := []byte("[pack]\nname = \"user-authored\"\nschema = 2\nversion = \"9.9.9\"\n")
+	preExistingCity := []byte("[workspace]\nname = \"user-authored\"\nprovider = \"claude\"\n")
+	preExistingPrompt := []byte("user-authored mayor prompt\n")
+	for _, f := range []struct {
+		path string
+		data []byte
+	}{
+		{filepath.Join(cityPath, "pack.toml"), preExistingPack},
+		{filepath.Join(cityPath, "city.toml"), preExistingCity},
+		{filepath.Join(cityPath, "agents", "mayor", "prompt.template.md"), preExistingPrompt},
+	} {
+		if err := os.WriteFile(f.path, f.data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	src := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(src,
+		[]byte("[workspace]\nname = \"from-template\"\nprovider = \"claude\"\n\n[[agent]]\nname = \"mayor\"\nprompt_template = \"prompts/mayor.md\"\n"),
+		0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cmdInitFromTOMLFileWithOptions(fsys.OSFS{}, src, cityPath, "", &stdout, &stderr, true, true)
+	if code != 0 {
+		t.Fatalf("cmdInitFromTOMLFileWithOptions = %d, want 0; stderr: %s", code, stderr.String())
+	}
+
+	for _, f := range []struct {
+		path string
+		want []byte
+	}{
+		{filepath.Join(cityPath, "pack.toml"), preExistingPack},
+		{filepath.Join(cityPath, "city.toml"), preExistingCity},
+		{filepath.Join(cityPath, "agents", "mayor", "prompt.template.md"), preExistingPrompt},
+	} {
+		got, err := os.ReadFile(f.path)
+		if err != nil {
+			t.Fatalf("reading %s: %v", f.path, err)
+		}
+		if !bytes.Equal(got, f.want) {
+			t.Errorf("%s was rewritten under --preserve-existing\n got: %s\nwant: %s", f.path, got, f.want)
+		}
+	}
+
+	out := stdout.String()
+	for _, want := range []string{"Preserved existing pack.toml.", "Preserved existing city.toml."} {
+		if !strings.Contains(out, want) {
+			t.Errorf("stdout missing %q; got:\n%s", want, out)
+		}
+	}
+}
+
+func TestCmdInitFromTOMLFilePreserveExistingBlockedByScaffold(t *testing.T) {
+	f := fsys.NewFake()
+	cityPath := "/city"
+
+	// A fully-initialized runtime scaffold should still cause init to refuse,
+	// even with --preserve-existing. Only committed config files are meant to
+	// be tolerated; an active runtime indicates the city is already live.
+	f.Files[filepath.Join(cityPath, ".gc", "events.jsonl")] = []byte("")
+	for _, sub := range []string{"cache", "runtime", "system"} {
+		f.Dirs[filepath.Join(cityPath, ".gc", sub)] = true
+	}
+	f.Dirs[filepath.Join(cityPath, ".gc")] = true
+
+	dir := t.TempDir()
+	src := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(src, []byte("[workspace]\nname = \"x\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cmdInitFromTOMLFileWithOptions(f, src, cityPath, "", &stdout, &stderr, true, true)
+	if code != initExitAlreadyInitialized {
+		t.Errorf("code = %d, want %d", code, initExitAlreadyInitialized)
+	}
+	if !strings.Contains(stderr.String(), "already initialized") {
+		t.Errorf("stderr = %q, want 'already initialized'", stderr.String())
+	}
+}
+
+func TestWriteInitFile_PreserveExistingStatError(t *testing.T) {
+	// When preserve=true, a Stat error that isn't os.IsNotExist must surface
+	// to the caller instead of being silently treated as "does not exist".
+	f := fsys.NewFake()
+	target := "/city/pack.toml"
+	f.Errors[target] = errors.New("permission denied")
+
+	wrote, err := writeInitFile(f, target, []byte("new"), true)
+	if err == nil {
+		t.Fatal("expected error propagation, got nil")
+	}
+	if wrote {
+		t.Errorf("wrote = true on stat error; want false")
+	}
+	// Must not have attempted to write over the file.
+	for _, c := range f.Calls {
+		if c.Method == "WriteFile" && c.Path == target {
+			t.Errorf("WriteFile called despite stat error; calls=%v", f.Calls)
+		}
+	}
+}
+
+func TestWriteInitFile_PreserveFalseOverwrites(t *testing.T) {
+	// When preserve=false, the helper writes unconditionally — even over
+	// an existing file — mirroring the pre-flag default behavior.
+	f := fsys.NewFake()
+	target := "/city/pack.toml"
+	f.Files[target] = []byte("existing")
+
+	wrote, err := writeInitFile(f, target, []byte("replacement"), false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !wrote {
+		t.Errorf("wrote = false; want true when preserve=false")
+	}
+	if got := string(f.Files[target]); got != "replacement" {
+		t.Errorf("file contents = %q, want %q", got, "replacement")
+	}
+}
+
+// TestDoInitPreservesExistingPackToml exercises the wizard-init path
+// (`doInit`, not `cmdInitFromTOMLFileWithOptions`) with `preserveExisting=true`
+// and a pre-seeded pack.toml. Covers the "Preserved existing pack.toml."
+// stdout branch unique to the wizard path.
+func TestDoInitPreservesExistingPackToml(t *testing.T) {
+	f := fsys.NewFake()
+	// Pre-seed pack.toml. No pre-seeded city.toml — that would route
+	// doInit into the separate "bootstrap existing" path above the
+	// preserve branches and never reach the pack.toml write.
+	preExistingPack := []byte("[pack]\nname = \"user-authored\"\nschema = 2\nversion = \"9.9.9\"\n")
+	f.Files["/city/pack.toml"] = preExistingPack
+
+	var stdout, stderr bytes.Buffer
+	code := doInit(f, "/city", defaultWizardConfig(), "", &stdout, &stderr, true)
+	if code != 0 {
+		t.Fatalf("doInit = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	if got := f.Files["/city/pack.toml"]; !bytes.Equal(got, preExistingPack) {
+		t.Errorf("pack.toml was rewritten under preserveExisting=true\n got: %s\nwant: %s", got, preExistingPack)
+	}
+	if !strings.Contains(stdout.String(), "Preserved existing pack.toml.") {
+		t.Errorf("stdout missing preservation log; got:\n%s", stdout.String())
+	}
+}
+
+// TestCmdInitFromFileWithOptionsUsesCWDWhenArgsEmpty covers the wrapper
+// branch that defaults cityPath to the current working directory when no
+// positional arg is supplied. The inner `cmdInitFromTOMLFileWithOptions`
+// call is exercised by the broader preserve-existing test; this case
+// pins the wrapper's default-path behavior itself.
+func TestCmdInitFromFileWithOptionsUsesCWDWhenArgsEmpty(t *testing.T) {
+	configureIsolatedRuntimeEnv(t)
+
+	dir := t.TempDir()
+	t.Chdir(dir)
+
+	src := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(src,
+		[]byte("[workspace]\nname = \"from-template\"\nprovider = \"claude\"\n"),
+		0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cmdInitFromFileWithOptions(src, nil, "", &stdout, &stderr, true, false)
+	if code != 0 {
+		t.Fatalf("cmdInitFromFileWithOptions = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	// Init should have written city.toml into the CWD.
+	if _, err := os.Stat(filepath.Join(dir, "city.toml")); err != nil {
+		t.Errorf("city.toml not written to CWD: %v", err)
 	}
 }
 
@@ -2612,6 +3736,82 @@ func TestDoInitFromDirSuccess(t *testing.T) {
 	}
 }
 
+// TestDoInitFromDirMaterializesPackOverlayClaudeSettings locks the fix for
+// stg-wvpl: pack-overlay universal files (notably .claude/settings.json) must
+// be present at the city root by the end of `gc init`. Otherwise the file is
+// materialized later, during the first session's tmux/adapter.go:Start, and
+// the supervisor's reconcile sees a content drift on .gc/settings.json that
+// drains every still-waking session — including ones that never woke yet
+// (deacon).
+func TestDoInitFromDirMaterializesPackOverlayClaudeSettings(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_DOLT", "skip")
+	configureIsolatedRuntimeEnv(t)
+
+	dir := t.TempDir()
+
+	srcDir := filepath.Join(dir, "src")
+	if err := os.MkdirAll(filepath.Join(srcDir, "packs", "demo", "overlay", ".claude"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "city.toml"),
+		[]byte("[workspace]\nname = \"template\"\nprovider = \"claude\"\nincludes = [\"packs/demo\"]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "pack.toml"),
+		[]byte("[pack]\nname = \"template\"\nschema = 2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "packs", "demo", "pack.toml"),
+		[]byte("[pack]\nname = \"demo\"\nschema = 2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	overlayPayload := []byte(`{"permissions":{"allow":["Bash"]}}`)
+	overlaySrc := filepath.Join(srcDir, "packs", "demo", "overlay", ".claude", "settings.json")
+	if err := os.WriteFile(overlaySrc, overlayPayload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cityPath := filepath.Join(dir, "city")
+	if err := os.MkdirAll(cityPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := doInitFromDir(srcDir, cityPath, &stdout, &stderr); code != 0 {
+		t.Fatalf("doInitFromDir = %d; stderr: %s", code, stderr.String())
+	}
+
+	overlayDst := filepath.Join(cityPath, ".claude", "settings.json")
+	got, err := os.ReadFile(overlayDst)
+	if err != nil {
+		t.Fatalf("expected %s materialized at init: %v", overlayDst, err)
+	}
+	// Compare structurally — the merge layer may re-marshal the JSON, but
+	// the overlay's content must be present.
+	var gotJSON, wantJSON map[string]any
+	if err := json.Unmarshal(got, &gotJSON); err != nil {
+		t.Fatalf("parsing materialized override: %v\n%s", err, got)
+	}
+	if err := json.Unmarshal(overlayPayload, &wantJSON); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(gotJSON, wantJSON) {
+		t.Errorf("city .claude/settings.json = %v, want %v", gotJSON, wantJSON)
+	}
+
+	// .gc/settings.json must reflect the overlay-merged base — without the
+	// fix it would only contain embedded defaults and be re-written on the
+	// first reconcile after session-start materialization.
+	runtime, err := os.ReadFile(filepath.Join(cityPath, ".gc", "settings.json"))
+	if err != nil {
+		t.Fatalf("reading runtime settings: %v", err)
+	}
+	if !strings.Contains(string(runtime), `"Bash"`) {
+		t.Errorf("runtime .gc/settings.json missing overlay-provided permission entry, got:\n%s", runtime)
+	}
+}
+
 func TestResolveCityName(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -2710,7 +3910,7 @@ func TestInitNameFlagWithFile(t *testing.T) {
 	cityPath := filepath.Join(dir, "target-dir")
 
 	var stdout, stderr bytes.Buffer
-	code := cmdInitFromFileWithOptions(tomlFile, []string{cityPath}, "my-file-name", &stdout, &stderr, true)
+	code := cmdInitFromFileWithOptions(tomlFile, []string{cityPath}, "my-file-name", &stdout, &stderr, true, false)
 	if code != 0 {
 		t.Fatalf("cmdInitFromFileWithOptions = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -2738,7 +3938,7 @@ func TestInitNameFlagWithBareInit(t *testing.T) {
 	code := doInit(fsys.OSFS{}, cityPath, wizardConfig{
 		configName: "minimal",
 		provider:   "claude",
-	}, "my-bare-name", &stdout, &stderr)
+	}, "my-bare-name", &stdout, &stderr, false)
 	if code != 0 {
 		t.Fatalf("doInit = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -3692,17 +4892,7 @@ func TestDoStopStopError(t *testing.T) {
 // --- doAgentAdd (with fsys.Fake) ---
 
 func TestDoAgentAddSuccess(t *testing.T) {
-	f := fsys.NewFake()
-	cfg := config.DefaultCity("bright-lights")
-	data, err := cfg.Marshal()
-	if err != nil {
-		t.Fatal(err)
-	}
-	f.Files[filepath.Join("/city", "city.toml")] = data
-	f.Files[filepath.Join("/city", "pack.toml")] = []byte(`[pack]
-name = "bright-lights"
-schema = 2
-`)
+	f := v2CityWithPack(t)
 
 	var stdout, stderr bytes.Buffer
 	code := doAgentAdd(f, "/city", "worker", "", "", false, &stdout, &stderr)
@@ -3741,17 +4931,7 @@ schema = 2
 }
 
 func TestDoAgentAddDuplicate(t *testing.T) {
-	f := fsys.NewFake()
-	cfg := config.DefaultCity("bright-lights")
-	data, err := cfg.Marshal()
-	if err != nil {
-		t.Fatal(err)
-	}
-	f.Files[filepath.Join("/city", "city.toml")] = data
-	f.Files[filepath.Join("/city", "pack.toml")] = []byte(`[pack]
-name = "bright-lights"
-schema = 2
-`)
+	f := v2CityWithPack(t)
 
 	var stdout, stderr bytes.Buffer
 	if code := doAgentAdd(f, "/city", "dupe", "", "", false, &stdout, &stderr); code != 0 {
@@ -3890,17 +5070,7 @@ func TestResolveAgentChoiceUnknown(t *testing.T) {
 }
 
 func TestDoAgentAddWithPromptTemplate(t *testing.T) {
-	f := fsys.NewFake()
-	cfg := config.DefaultCity("bright-lights")
-	data, err := cfg.Marshal()
-	if err != nil {
-		t.Fatal(err)
-	}
-	f.Files[filepath.Join("/city", "city.toml")] = data
-	f.Files[filepath.Join("/city", "pack.toml")] = []byte(`[pack]
-name = "bright-lights"
-schema = 2
-`)
+	f := v2CityWithPack(t)
 	f.Files[filepath.Join("/city", "templates", "worker.md")] = []byte("prompt")
 
 	var stdout, stderr bytes.Buffer
@@ -4241,6 +5411,9 @@ prompt_template = "prompts/mayor.md"
 // rather than being reported as an error. Strict is for debugging typos
 // and template mistakes, not for rejecting valid minimal configs.
 func TestDoPrimeStrictAgentWithEmptyPromptTemplate(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+
 	dir := t.TempDir()
 	gcDir := filepath.Join(dir, ".gc")
 	if err := os.MkdirAll(gcDir, 0o755); err != nil {
@@ -4253,6 +5426,7 @@ name = "test-city"
 
 [[agent]]
 name = "mayor"
+max_active_sessions = 1
 `
 	if err := os.WriteFile(filepath.Join(dir, "city.toml"), []byte(toml), 0o644); err != nil {
 		t.Fatal(err)
@@ -4280,6 +5454,9 @@ name = "mayor"
 // silently swallows by returning "", which strict mode needs to surface
 // with the underlying stat reason.
 func TestDoPrimeStrictMissingTemplateFile(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+
 	dir := t.TempDir()
 	gcDir := filepath.Join(dir, ".gc")
 	if err := os.MkdirAll(gcDir, 0o755); err != nil {
@@ -4316,6 +5493,9 @@ prompt_template = "prompts/does-not-exist.md"
 }
 
 func TestDoPrimeStrictAbsoluteTemplatePath(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+
 	dir := t.TempDir()
 	gcDir := filepath.Join(dir, ".gc")
 	if err := os.MkdirAll(gcDir, 0o755); err != nil {
@@ -4361,6 +5541,9 @@ prompt_template = %q
 // substantial content. The absence of this test would let the missing-
 // file strict check quietly regress into a broader empty-render check.
 func TestDoPrimeStrictTemplateRendersLegitimatelyEmpty(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+
 	dir := t.TempDir()
 	gcDir := filepath.Join(dir, ".gc")
 	if err := os.MkdirAll(gcDir, 0o755); err != nil {
@@ -4413,6 +5596,9 @@ prompt_template = "prompts/mayor.md"
 // effects (persisting the session ID to .runtime/session_id) do NOT fire.
 // A failing strict invocation must not leave partial state behind.
 func TestDoPrimeStrictHookModeDoesNotPersistSessionOnFailure(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+
 	dir := t.TempDir()
 	gcDir := filepath.Join(dir, ".gc")
 	if err := os.MkdirAll(gcDir, 0o755); err != nil {
@@ -4455,6 +5641,9 @@ name = "mayor"
 // effects. A missing prompt_template is a strict failure, so it must not
 // leave behind a session id for the failed hook invocation.
 func TestDoPrimeStrictHookModeMissingTemplateDoesNotPersistSessionOnFailure(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+
 	dir := t.TempDir()
 	gcDir := filepath.Join(dir, ".gc")
 	if err := os.MkdirAll(gcDir, 0o755); err != nil {
@@ -4499,6 +5688,9 @@ prompt_template = "prompts/does-not-exist.md"
 // session-id persistence DOES fire — the deferral is not a regression of
 // hook behavior for the success path.
 func TestDoPrimeStrictHookModePersistsSessionOnSuccess(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+
 	dir := t.TempDir()
 	gcDir := filepath.Join(dir, ".gc")
 	if err := os.MkdirAll(gcDir, 0o755); err != nil {
@@ -4613,6 +5805,9 @@ prompt_template = "prompts/mayor.md"
 // Without this guard, the strict deferral silently drops session-id
 // persistence on the suspended-agent success path.
 func TestDoPrimeStrictHookModeOnSuspendedAgentPersistsSessionID(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+
 	dir := t.TempDir()
 	gcDir := filepath.Join(dir, ".gc")
 	if err := os.MkdirAll(gcDir, 0o755); err != nil {
@@ -4768,11 +5963,67 @@ max = -1
 	}
 }
 
+func TestDoPrimeFormulaV2GraphWorkerPromptClaimsRoutedWork(t *testing.T) {
+	dir := t.TempDir()
+	if err := materializeBuiltinPrompts(dir); err != nil {
+		t.Fatalf("materializeBuiltinPrompts: %v", err)
+	}
+	t.Setenv("GC_CITY", "")
+	t.Setenv("GC_CITY_PATH", "")
+	t.Setenv("GC_CITY_ROOT", "")
+	t.Setenv("GC_DIR", "")
+	t.Setenv("GC_RIG", "")
+	t.Setenv("GC_RIG_ROOT", "")
+	tomlContent := `[workspace]
+name = "test-city"
+
+[daemon]
+formula_v2 = true
+
+[[agent]]
+name = "worker"
+dir = "myrig"
+start_command = "echo"
+
+[agent.pool]
+min = 0
+max = -1
+`
+	if err := os.WriteFile(filepath.Join(dir, "city.toml"), []byte(tomlContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	orig, _ := os.Getwd()
+	t.Cleanup(func() { _ = os.Chdir(orig) })
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doPrime([]string{"worker"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doPrime = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "gc hook") {
+		t.Fatalf("graph-worker prompt missing gc hook routed-queue lookup:\n%s", out)
+	}
+	if !strings.Contains(out, "bd update <id> --claim") {
+		t.Fatalf("graph-worker prompt missing atomic claim instruction:\n%s", out)
+	}
+	if !strings.Contains(out, "Do not start work with `bd update --status in_progress`") {
+		t.Fatalf("graph-worker prompt missing guard against unassigned in_progress work:\n%s", out)
+	}
+}
+
 func materializeBuiltinPrompts(cityPath string) error {
 	return MaterializeBuiltinPacks(cityPath)
 }
 
 func TestDoPrimeHookPersistsSessionID(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+
 	dir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(dir, ".gc"), 0o755); err != nil {
 		t.Fatal(err)
@@ -5207,17 +6458,7 @@ func TestCurrentRigContextUsesWorkingDirThroughSymlinkAlias(t *testing.T) {
 // --- doAgentAdd with --dir and --suspended ---
 
 func TestDoAgentAddWithDir(t *testing.T) {
-	f := fsys.NewFake()
-	cfg := config.DefaultCity("bright-lights")
-	data, err := cfg.Marshal()
-	if err != nil {
-		t.Fatal(err)
-	}
-	f.Files[filepath.Join("/city", "city.toml")] = data
-	f.Files[filepath.Join("/city", "pack.toml")] = []byte(`[pack]
-name = "bright-lights"
-schema = 2
-`)
+	f := v2CityWithPack(t)
 
 	var stdout, stderr bytes.Buffer
 	code := doAgentAdd(f, "/city", "builder", "", "hello-world", false, &stdout, &stderr)
@@ -5253,17 +6494,7 @@ schema = 2
 }
 
 func TestDoAgentAddWithSuspended(t *testing.T) {
-	f := fsys.NewFake()
-	cfg := config.DefaultCity("bright-lights")
-	data, err := cfg.Marshal()
-	if err != nil {
-		t.Fatal(err)
-	}
-	f.Files[filepath.Join("/city", "city.toml")] = data
-	f.Files[filepath.Join("/city", "pack.toml")] = []byte(`[pack]
-name = "bright-lights"
-schema = 2
-`)
+	f := v2CityWithPack(t)
 
 	var stdout, stderr bytes.Buffer
 	code := doAgentAdd(f, "/city", "builder", "", "hello-world", true, &stdout, &stderr)

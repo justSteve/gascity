@@ -375,6 +375,40 @@ func TestHandleReloadSocketCmdWaitsForAcceptedAfterHandoff(t *testing.T) {
 	}
 }
 
+func TestControllerReloadAcceptTimeoutDefault(t *testing.T) {
+	if controllerReloadAcceptTimeout != 60*time.Second {
+		t.Fatalf("controllerReloadAcceptTimeout = %s, want 60s", controllerReloadAcceptTimeout)
+	}
+}
+
+func TestReloadControlReadTimeoutAsyncOutlastsAcceptAndAckWindow(t *testing.T) {
+	readTimeout, err := reloadControlReadTimeout(reloadControlRequest{Wait: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if readTimeout <= 15*time.Second {
+		t.Fatalf("async read timeout = %s, want above old 15s client deadline", readTimeout)
+	}
+	if wantMin := 2*controllerReloadAcceptTimeout + 5*time.Second; readTimeout <= wantMin {
+		t.Fatalf("async read timeout = %s, want above controller window %s", readTimeout, wantMin)
+	}
+}
+
+func TestReloadControlReadTimeoutWaitIncludesRequestedTimeout(t *testing.T) {
+	oldAccept := controllerReloadAcceptTimeout
+	controllerReloadAcceptTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { controllerReloadAcceptTimeout = oldAccept })
+
+	readTimeout, err := reloadControlReadTimeout(reloadControlRequest{Wait: true, Timeout: "40ms"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := 2*controllerReloadAcceptTimeout + 40*time.Millisecond + 10*time.Second
+	if readTimeout != want {
+		t.Fatalf("read timeout = %s, want %s", readTimeout, want)
+	}
+}
+
 func TestSendReloadControlRequestNoChange(t *testing.T) {
 	sp := runtime.NewFake()
 
@@ -392,14 +426,16 @@ func TestSendReloadControlRequestNoChange(t *testing.T) {
 	}
 
 	dir := shortSocketTempDir(t, "gc-reload-no-change-")
+	cleanupManagedDoltTestCity(t, dir)
 	if err := os.MkdirAll(filepath.Join(dir, ".gc"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	tomlPath := writeCityTOML(t, dir, "test", "mayor")
-	cfg, prov, err := config.LoadWithIncludes(osFS{}, tomlPath)
+	cfg, prov, err := loadCityConfigWithBuiltinPacks(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
+	applyFeatureFlags(cfg)
 	configRev := config.Revision(osFS{}, prov, cfg, dir)
 
 	var stdout, stderr bytes.Buffer
@@ -437,9 +473,30 @@ func TestSendReloadControlRequestNoChange(t *testing.T) {
 	if reply.Message != "No config changes detected." {
 		t.Fatalf("reply.Message = %q", reply.Message)
 	}
-	if len(reply.Warnings) != 0 {
-		t.Fatalf("reply.Warnings = %v, want none", reply.Warnings)
+	// The fixture intentionally uses [[agent]] which now emits a loud v1
+	// surface deprecation warning at every config load. That warning is
+	// not what this test guards — filter it out so the assertion still
+	// reflects "no other warnings".
+	if other := warningsWithoutV1Surfaces(reply.Warnings); len(other) != 0 {
+		t.Fatalf("reply.Warnings = %v, want none (besides v1-surface deprecations)", other)
 	}
+}
+
+// warningsWithoutV1Surfaces filters out warnings produced by
+// config.DetectLegacyV1Surfaces so existing tests whose fixtures use
+// the deprecated v1 surfaces continue to assert on the non-v1 set.
+func warningsWithoutV1Surfaces(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(in))
+	for _, w := range in {
+		if config.IsLegacyV1SurfaceWarning(w) {
+			continue
+		}
+		out = append(out, w)
+	}
+	return out
 }
 
 func TestSendReloadControlRequestInvalidConfig(t *testing.T) {
@@ -459,17 +516,26 @@ func TestSendReloadControlRequestInvalidConfig(t *testing.T) {
 	}
 
 	dir := shortSocketTempDir(t, "gc-reload-invalid-")
+	cleanupManagedDoltTestCity(t, dir)
 	if err := os.MkdirAll(filepath.Join(dir, ".gc"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	tomlPath := writeCityTOML(t, dir, "test", "mayor")
-	cfg, prov, err := config.LoadWithIncludes(osFS{}, tomlPath)
+	cfg, prov, err := loadCityConfigWithBuiltinPacks(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
+	applyFeatureFlags(cfg)
+	var stdout, stderr bytes.Buffer
+	allOrders, err := scanAllOrders(dir, cfg, &stderr, "gc reload test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, order := range allOrders {
+		cfg.Orders.Skip = append(cfg.Orders.Skip, order.Name)
+	}
 	configRev := config.Revision(osFS{}, prov, cfg, dir)
 
-	var stdout, stderr bytes.Buffer
 	done := make(chan struct{})
 	go func() {
 		runController(dir, tomlPath, cfg, configRev, buildFn, nil, sp, nil, nil, nil, nil, events.Discard, nil, &stdout, &stderr)
@@ -494,21 +560,48 @@ func TestSendReloadControlRequestInvalidConfig(t *testing.T) {
 		}
 	}
 
+	oldDebounce := debounceDelay
+	debounceDelay = 30 * time.Second
+	t.Cleanup(func() {
+		debounceDelay = oldDebounce
+	})
 	if err := os.WriteFile(tomlPath, []byte("[[[ bad toml"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	reply, err := sendReloadControlRequest(dir, reloadControlRequest{Wait: true, Timeout: "1s"})
-	if err != nil {
-		t.Fatalf("sendReloadControlRequest: %v", err)
+	stdoutBeforeInvalid := stdout.String()
+	var reply reloadControlReply
+	deadline = time.After(45 * time.Second)
+	for {
+		reply, err = sendReloadControlRequest(dir, reloadControlRequest{Wait: true, Timeout: "30s"})
+		if err != nil {
+			t.Fatalf("sendReloadControlRequest: %v", err)
+		}
+		if reply.Outcome != reloadOutcomeBusy {
+			break
+		}
+		if strings.Contains(stderr.String(), "config reload") {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("reload stayed busy; last reply = %+v", reply)
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
 	}
-	if reply.Outcome != reloadOutcomeFailed {
-		t.Fatalf("reply.Outcome = %q, want %q", reply.Outcome, reloadOutcomeFailed)
-	}
-	if !strings.Contains(reply.Error, "parsing city.toml") {
+	switch {
+	case reply.Outcome == reloadOutcomeBusy:
+		if !strings.Contains(stderr.String(), "config reload") {
+			t.Fatalf("busy reload did not produce invalid config error; stderr=%q", stderr.String())
+		}
+	case reply.Outcome != reloadOutcomeFailed:
+		t.Fatalf("reply.Outcome = %q, want %q; stdout=%q stderr=%q",
+			reply.Outcome, reloadOutcomeFailed, stdout.String(), stderr.String())
+	case !strings.Contains(reply.Error, "parsing city.toml"):
 		t.Fatalf("reply.Error = %q", reply.Error)
 	}
-	if strings.Contains(stdout.String(), "Config reloaded:") {
+	if strings.Contains(strings.TrimPrefix(stdout.String(), stdoutBeforeInvalid), "Config reloaded:") {
 		t.Fatalf("stdout unexpectedly contains reload success: %q", stdout.String())
 	}
 }

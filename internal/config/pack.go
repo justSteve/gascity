@@ -14,6 +14,7 @@ import (
 	"github.com/BurntSushi/toml"
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/orders"
+	"github.com/gastownhall/gascity/internal/pricing"
 )
 
 // packFile is the expected filename inside a pack directory.
@@ -39,6 +40,7 @@ type packConfig struct {
 	Doctor         []PackDoctorEntry       `toml:"doctor,omitempty"`
 	Commands       []PackCommandEntry      `toml:"commands,omitempty"`
 	Global         PackGlobal              `toml:"global,omitempty"`
+	Pricing        []pricing.ModelPricing  `toml:"pricing,omitempty"`
 }
 
 type packDefaults struct {
@@ -1295,6 +1297,13 @@ func loadPackWithCacheOptionsLocked(fs fsys.FS, topoPath, topoDir, cityRoot, rig
 	// Collect this pack's own requirements.
 	allRequires = append(allRequires, tc.Pack.Requires...)
 
+	// Stamp layoutV1Inline on this pack's [[agent]] blocks BEFORE v2
+	// discovery appends to tc.Agents. Discovery stamps layoutV2Convention
+	// itself; the field is preserved through the merge below. (ga-9ogb)
+	for i := range tc.Agents {
+		tc.Agents[i].layout = layoutV1Inline
+	}
+
 	// V2 convention-based agent discovery: scan agents/ directory.
 	// Convention-discovered agents are appended AFTER TOML-declared agents
 	// so [[agent]] tables take precedence when both exist.
@@ -1343,6 +1352,10 @@ func loadPackWithCacheOptionsLocked(fs fsys.FS, topoPath, topoDir, cityRoot, rig
 		}
 		// Track where this agent's config was defined.
 		agents[i].SourceDir = topoDir
+		// Stamp source provenance (ga-tpfc). expandCityPacks may
+		// later override sourcePack → sourceAutoImport for bindings
+		// that came from [defaults.rig.imports].
+		agents[i].source = sourcePack
 		// Resolve prompt_template paths relative to pack directory.
 		if agents[i].PromptTemplate != "" {
 			agents[i].PromptTemplate = adjustFragmentPath(
@@ -1584,6 +1597,7 @@ func deepCopyOptionChoices(in []OptionChoice) []OptionChoice {
 	for i := range in {
 		out[i] = in[i]
 		out[i].FlagArgs = append([]string(nil), in[i].FlagArgs...)
+		out[i].FlagAliases = cloneStringSlices(in[i].FlagAliases)
 	}
 	return out
 }
@@ -2403,8 +2417,8 @@ func applyAgentOverride(a *Agent, ov *AgentOverride) {
 	if ov.WakeMode != nil {
 		a.WakeMode = *ov.WakeMode
 	}
-	if len(ov.InjectFragments) > 0 {
-		a.InjectFragments = append([]string(nil), ov.InjectFragments...)
+	if ov.InjectFragments != nil {
+		a.InjectFragments = append([]string(nil), (*ov.InjectFragments)...)
 	}
 	if len(ov.AppendFragments) > 0 {
 		a.AppendFragments = append([]string(nil), ov.AppendFragments...)
@@ -2510,6 +2524,9 @@ func collectFiles(fs fsys.FS, base, prefix string, out *[]string) {
 	if prefix != "" {
 		dir = filepath.Join(base, prefix)
 	}
+	if prefix != "" && isIgnoredPackRuntimePath(prefix) {
+		return
+	}
 	entries, err := fs.ReadDir(dir)
 	if err != nil {
 		return
@@ -2519,12 +2536,32 @@ func collectFiles(fs fsys.FS, base, prefix string, out *[]string) {
 		if prefix != "" {
 			rel = prefix + "/" + e.Name()
 		}
+		if isIgnoredPackRuntimePath(rel) {
+			continue
+		}
 		if e.IsDir() {
 			collectFiles(fs, base, rel, out)
 		} else {
 			*out = append(*out, rel)
 		}
 	}
+}
+
+func isIgnoredPackRuntimePath(path string) bool {
+	parts := strings.FieldsFunc(filepath.ToSlash(path), func(r rune) bool { return r == '/' })
+	if len(parts) == 0 {
+		return false
+	}
+	switch parts[0] {
+	case ".beads", ".cache", ".gc", ".git", "state", "tmp":
+		return true
+	}
+	for _, part := range parts {
+		if part == "__pycache__" {
+			return true
+		}
+	}
+	return false
 }
 
 // resolveNamedPacks translates named pack references to cache paths.

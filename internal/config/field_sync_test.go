@@ -19,7 +19,7 @@ func TestAgentFieldSync(t *testing.T) {
 	// Add to this list with a comment explaining why.
 	excluded := map[string]string{
 		"Name":        "identity field, not overridable",
-		"Description": "display field for MC session creation UI, not overridable via patch",
+		"Description": "display field for real-world app session creation UI, not overridable via patch",
 		// Provider-level fields: set during ResolveProvider, not typically
 		// overridden per-rig. Agent-level overrides happen in the Agent
 		// struct itself (which feeds into ResolveProvider).
@@ -53,6 +53,8 @@ func TestAgentFieldSync(t *testing.T) {
 		"NamepoolNames":                "runtime-only, loaded from Namepool file at config load time",
 		"BindingName":                  "runtime-only, set during V2 import expansion, not user-configurable",
 		"PackName":                     "runtime-only, set during V2 import expansion, not user-configurable",
+		"source":                       "runtime-only unexported provenance enum (ga-tpfc); stamped at discovery, not patched or overridden",
+		"layout":                       "runtime-only unexported pack-layout enum (ga-9ogb); stamped at discovery, not patched or overridden",
 	}
 
 	// Fields on AgentOverride/AgentPatch that don't map 1:1 to Agent fields.
@@ -188,7 +190,7 @@ func TestApplyAgentPatchCoversAllFields(t *testing.T) {
 		SessionLive:             []string{"live-cmd"},
 		OverlayDir:              strVal("overlays/test"),
 		DefaultSlingFormula:     strVal("mol-work"),
-		InjectFragments:         []string{"frag1"},
+		InjectFragments:         Fragments("frag1"),
 		AppendFragments:         []string{"append1"},
 		DependsOn:               []string{"other-agent"},
 		ResumeCommand:           strVal("claude --resume {{.SessionKey}}"),
@@ -336,7 +338,7 @@ func TestApplyAgentOverrideCoversAllFields(t *testing.T) {
 		SessionLive:             []string{"live-cmd"},
 		OverlayDir:              strVal("overlays/test"),
 		DefaultSlingFormula:     strVal("mol-work"),
-		InjectFragments:         []string{"frag1"},
+		InjectFragments:         Fragments("frag1"),
 		AppendFragments:         []string{"append1"},
 		DependsOn:               []string{"other-agent"},
 		ResumeCommand:           strVal("claude --resume {{.SessionKey}}"),

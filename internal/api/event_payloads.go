@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
@@ -28,45 +29,97 @@ type MailEventPayload struct {
 // IsEventPayload marks MailEventPayload as an events.Payload variant.
 func (MailEventPayload) IsEventPayload() {}
 
-// CityLifecyclePayload is emitted by city lifecycle events. Keeping all
-// same-shaped city lifecycle payloads on one Go type keeps the generated
-// EventPayload oneOf unambiguous for validators that only see the payload
-// object, not the enclosing event type.
+// Operation constants used by RequestFailedPayload.
+const (
+	RequestOperationCityCreate     = "city.create"
+	RequestOperationCityUnregister = "city.unregister"
+	RequestOperationSessionCreate  = "session.create"
+	RequestOperationSessionMessage = "session.message"
+	RequestOperationSessionSubmit  = "session.submit"
+)
+
+// --- Typed async request result payloads ---
+//
+// 5 success types (one per operation, fully typed) + 1 shared failure
+// type. The event type encodes operation and outcome; no string
+// discriminator fields on success payloads.
+
+// CityCreateSucceededPayload is emitted on request.result.city.create.
+type CityCreateSucceededPayload struct {
+	RequestID string `json:"request_id" doc:"Correlation ID from the 202 response."`
+	Name      string `json:"name" doc:"Resolved city name."`
+	Path      string `json:"path" doc:"Resolved absolute city directory path."`
+}
+
+// IsEventPayload marks CityCreateSucceededPayload as an events.Payload variant.
+func (CityCreateSucceededPayload) IsEventPayload() {}
+
+// CityUnregisterSucceededPayload is emitted on request.result.city.unregister.
+type CityUnregisterSucceededPayload struct {
+	RequestID string `json:"request_id" doc:"Correlation ID from the 202 response."`
+	Name      string `json:"name" doc:"City name that was unregistered."`
+	Path      string `json:"path" doc:"Absolute city directory path."`
+}
+
+// IsEventPayload marks CityUnregisterSucceededPayload as an events.Payload variant.
+func (CityUnregisterSucceededPayload) IsEventPayload() {}
+
+// SessionCreateSucceededPayload is emitted on request.result.session.create.
+type SessionCreateSucceededPayload struct {
+	RequestID string          `json:"request_id" doc:"Correlation ID from the 202 response."`
+	Session   sessionResponse `json:"session" doc:"Full session state as returned by GET /session/{id}. For session.create, this result is emitted only after the session has left creating and can accept normal metadata and lifecycle commands."`
+}
+
+// IsEventPayload marks SessionCreateSucceededPayload as an events.Payload variant.
+func (SessionCreateSucceededPayload) IsEventPayload() {}
+
+// SessionMessageSucceededPayload is emitted on request.result.session.message.
+type SessionMessageSucceededPayload struct {
+	RequestID string `json:"request_id" doc:"Correlation ID from the 202 response."`
+	SessionID string `json:"session_id" doc:"Session ID that received the message."`
+}
+
+// IsEventPayload marks SessionMessageSucceededPayload as an events.Payload variant.
+func (SessionMessageSucceededPayload) IsEventPayload() {}
+
+// SessionSubmitSucceededPayload is emitted on request.result.session.submit.
+type SessionSubmitSucceededPayload struct {
+	RequestID string `json:"request_id" doc:"Correlation ID from the 202 response."`
+	SessionID string `json:"session_id" doc:"Session ID that received the submission."`
+	Queued    bool   `json:"queued" doc:"Whether the message was queued for later delivery."`
+	Intent    string `json:"intent" doc:"Resolved submit intent (default, follow_up, interrupt_now)."`
+}
+
+// IsEventPayload marks SessionSubmitSucceededPayload as an events.Payload variant.
+func (SessionSubmitSucceededPayload) IsEventPayload() {}
+
+// RequestFailedPayload is emitted on request.failed for any async
+// operation that fails. The operation enum identifies which operation.
+type RequestFailedPayload struct {
+	RequestID    string `json:"request_id" doc:"Correlation ID from the 202 response."`
+	Operation    string `json:"operation" enum:"city.create,city.unregister,session.create,session.message,session.submit" doc:"Which operation failed."`
+	ErrorCode    string `json:"error_code" doc:"Machine-readable error code."`
+	ErrorMessage string `json:"error_message" doc:"Human-readable error description."`
+}
+
+// IsEventPayload marks RequestFailedPayload as an events.Payload variant.
+func (RequestFailedPayload) IsEventPayload() {}
+
+// CityLifecyclePayload is the shape of non-terminal city.created and
+// city.unregister_requested events recorded in the per-city event log
+// during init/unregister for diagnostics.
 type CityLifecyclePayload struct {
-	Name            string   `json:"name"`
-	Path            string   `json:"path"`
-	Error           string   `json:"error,omitempty"`
-	PhasesCompleted []string `json:"phases_completed,omitempty"`
+	Name string `json:"name"`
+	Path string `json:"path"`
 }
 
 // IsEventPayload marks CityLifecyclePayload as an events.Payload variant.
 func (CityLifecyclePayload) IsEventPayload() {}
 
-// CityCreatedPayload is emitted on city.created when the supervisor's
-// POST /v0/city handler has scaffolded and registered a new city.
-type CityCreatedPayload = CityLifecyclePayload
-
-// CityReadyPayload is emitted on city.ready when the supervisor
-// reconciler has finished preparing a city.
-type CityReadyPayload = CityLifecyclePayload
-
-// CityInitFailedPayload is emitted on city.init_failed when the
-// supervisor reconciler fails to bring up a city.
-type CityInitFailedPayload = CityLifecyclePayload
-
-// CityUnregisterRequestedPayload is emitted when unregister starts.
-type CityUnregisterRequestedPayload = CityLifecyclePayload
-
-// CityUnregisteredPayload is emitted when unregister completes.
-type CityUnregisteredPayload = CityLifecyclePayload
-
-// CityUnregisterFailedPayload is emitted when unregister fails.
-type CityUnregisterFailedPayload = CityLifecyclePayload
-
 // BeadEventPayload is the shape of every bead.* event payload
 // (BeadCreated, BeadUpdated, BeadClosed). The payload carries a full
-// snapshot of the bead as of the event; it is emitted by the beads
-// CachingStore's reconcile loop when external changes are detected.
+// snapshot of the bead as of the event; it is emitted by bd hooks and by
+// the beads CachingStore's reconcile loop when external changes are detected.
 type BeadEventPayload struct {
 	Bead beads.Bead `json:"bead"`
 }
@@ -74,8 +127,113 @@ type BeadEventPayload struct {
 // IsEventPayload marks BeadEventPayload as an events.Payload variant.
 func (BeadEventPayload) IsEventPayload() {}
 
+// UnmarshalJSON accepts the current {"bead": ...} payload shape and the
+// legacy raw-bead shape emitted by older bd hook scripts.
+func (p *BeadEventPayload) UnmarshalJSON(data []byte) error {
+	var wrapped struct {
+		Bead *json.RawMessage `json:"bead"`
+	}
+	if err := json.Unmarshal(data, &wrapped); err != nil {
+		return err
+	}
+	if wrapped.Bead != nil {
+		bead, err := decodeBeadEventPayloadBead(*wrapped.Bead)
+		if err != nil {
+			return err
+		}
+		p.Bead = bead
+		return nil
+	}
+
+	bead, err := decodeBeadEventPayloadBead(data)
+	if err != nil {
+		return err
+	}
+	p.Bead = bead
+	return nil
+}
+
+func decodeBeadEventPayloadBead(data []byte) (beads.Bead, error) {
+	var wire struct {
+		ID           string          `json:"id"`
+		Title        string          `json:"title"`
+		Status       string          `json:"status"`
+		Type         string          `json:"issue_type"`
+		TypeCompat   string          `json:"type,omitempty"`
+		Priority     *int            `json:"priority,omitempty"`
+		CreatedAt    time.Time       `json:"created_at"`
+		Assignee     string          `json:"assignee,omitempty"`
+		From         string          `json:"from,omitempty"`
+		ParentID     string          `json:"parent,omitempty"`
+		Ref          string          `json:"ref,omitempty"`
+		Needs        []string        `json:"needs,omitempty"`
+		Description  string          `json:"description,omitempty"`
+		Labels       []string        `json:"labels,omitempty"`
+		Metadata     beads.StringMap `json:"metadata,omitempty"`
+		Dependencies []beads.Dep     `json:"dependencies,omitempty"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return beads.Bead{}, err
+	}
+	bead := beads.Bead{
+		ID:           wire.ID,
+		Title:        wire.Title,
+		Status:       wire.Status,
+		Type:         wire.Type,
+		Priority:     wire.Priority,
+		CreatedAt:    wire.CreatedAt,
+		Assignee:     wire.Assignee,
+		From:         wire.From,
+		ParentID:     wire.ParentID,
+		Ref:          wire.Ref,
+		Needs:        wire.Needs,
+		Description:  wire.Description,
+		Labels:       wire.Labels,
+		Dependencies: wire.Dependencies,
+	}
+	if bead.Type == "" {
+		bead.Type = wire.TypeCompat
+	}
+	if wire.Metadata != nil {
+		bead.Metadata = map[string]string(wire.Metadata)
+	}
+	return bead, nil
+}
+
 // WorkerOperationEventPayload is the typed payload projected for
 // worker.operation events on the supervisor event stream.
+//
+// Issue #1252 (1a) added the per-invocation cost/latency fields below
+// (Model through CostUSDEstimate).
+//
+// # Consumer contract — read this before using the 1a fields
+//
+// Every 1a field is BEST-EFFORT and OPTIONAL. The wire encoding uses
+// `omitempty` on each so an absent field literally does not appear in
+// the JSON. Consumers MUST treat the absence of a field (or its
+// zero value when reading typed Go) as "no data observed" and not as a
+// real signal:
+//
+//   - PromptTokens=0 does NOT mean "this op was free"; it means token
+//     extraction was not wired for this operation.
+//   - CostUSDEstimate=0 does NOT mean "this op cost nothing"; it means
+//     either tokens or pricing was not wired.
+//   - Empty Model / PromptVersion / PromptSHA do NOT mean "no model" or
+//     "version unknown"; they mean source-side wiring has not yet
+//     propagated metadata into the event.
+//
+// Aggregations that sum across events (per-agent cost, per-rig token
+// volumes) MUST filter to events that actually carry the field — for
+// example by checking `Model != ""` before bucketing by model. New
+// consumers should keep that presence check at their input boundary.
+//
+// # Wiring status (snapshot at PR #1272 merge)
+//
+// The "Wired" line on each field below tracks which source-side
+// wiring has landed. As subsequent PRs land follow-up wiring, those
+// lines should be updated. TestWorkerOperationPayload1aWiringStatusPin
+// fails when the runtime drifts from these annotations, catching a
+// missed update so consumer-side filtering can be revisited.
 type WorkerOperationEventPayload struct {
 	OpID        string    `json:"op_id"`
 	Operation   string    `json:"operation"`
@@ -91,6 +249,79 @@ type WorkerOperationEventPayload struct {
 	Queued      *bool     `json:"queued,omitempty"`
 	Delivered   *bool     `json:"delivered,omitempty"`
 	Error       string    `json:"error,omitempty"`
+
+	// 1a fields. All omitempty; consumers must treat the field set as
+	// best-effort. See the consumer contract on the type doc above.
+
+	// Model is the LLM model identifier observed in this operation
+	// (e.g. "claude-opus-4-7"). Sourced from session metadata.
+	//
+	// Wired: TODO — follow-up will tail sessionlog at finish() to
+	// extract msg.Model.
+	Model string `json:"model,omitempty" doc:"LLM model identifier (best-effort, may be absent until follow-up wiring lands)."`
+	// AgentName is the agent identity that ran this operation
+	// (e.g. "rig/polecat-1"). Distinct from SessionName which carries
+	// the canonical session identity.
+	//
+	// Wired: YES — sourced from session.Info.AgentName, with
+	// session.Info.Alias as a compatibility fallback.
+	AgentName string `json:"agent_name,omitempty" doc:"Qualified agent identity (best-effort, absent if the session has no agent_name metadata or alias)."`
+	// PromptVersion is the human-readable template version label from
+	// frontmatter (`version:` field). Surfaced in dashboards for grouping.
+	//
+	// Wired: TODO — promptmeta.FrontMatter is computed (PR #1272) but
+	// not propagated through session metadata into operation events
+	// yet. Currently always absent on the wire.
+	PromptVersion string `json:"prompt_version,omitempty" doc:"Template version frontmatter (best-effort, currently always absent; #1256 follow-up)."`
+	// PromptSHA is the SHA-256 hex digest of the rendered prompt.
+	// Distinguishes two runs that share PromptVersion but differ in
+	// rendered bytes (unbumped template edit).
+	//
+	// Wired: TODO — promptmeta.SHA is computed (PR #1272) but not
+	// propagated through session metadata yet. Currently always absent.
+	PromptSHA string `json:"prompt_sha,omitempty" doc:"SHA-256 of the rendered prompt (best-effort, currently always absent; #1256 follow-up)."`
+	// BeadID is the work bead this operation is acting on, when one
+	// exists. Empty for operations not tied to a bead (e.g. lifecycle
+	// transitions).
+	//
+	// Wired: TODO — operation context plumbing pending.
+	BeadID string `json:"bead_id,omitempty" doc:"Work bead this operation is acting on (best-effort, may be absent for non-bead-scoped ops)."`
+	// PromptTokens is the count of regular (non-cached) input tokens.
+	// Treat absence as "not measured", not "zero".
+	//
+	// Wired: TODO — sessionlog/tail.go already extracts the value for
+	// Claude; finish-time wiring through to this field is pending.
+	PromptTokens int `json:"prompt_tokens,omitempty" doc:"Non-cached input tokens (best-effort, currently always absent; treat zero as 'not measured', not 'free')."`
+	// CompletionTokens is the count of output tokens generated.
+	// Treat absence as "not measured".
+	//
+	// Wired: TODO — see PromptTokens.
+	CompletionTokens int `json:"completion_tokens,omitempty" doc:"Output tokens (best-effort, currently always absent)."`
+	// CacheReadTokens is the count of cached input tokens read.
+	// Distinct from PromptTokens because cache-read pricing is roughly
+	// 10× cheaper than prompt pricing on Claude. Treat absence as
+	// "not measured".
+	//
+	// Wired: TODO — see PromptTokens.
+	CacheReadTokens int `json:"cache_read_tokens,omitempty" doc:"Cached input tokens read (best-effort, currently always absent)."`
+	// CacheCreationTokens is the count of input tokens written into
+	// the prompt cache during this invocation.
+	//
+	// Wired: TODO — see PromptTokens.
+	CacheCreationTokens int `json:"cache_creation_tokens,omitempty" doc:"Input tokens written into the prompt cache (best-effort, currently always absent)."`
+	// LatencyMs is the wall-clock latency of the LLM invocation
+	// itself, where measurable. Distinct from DurationMs which times
+	// the wrapping operation.
+	//
+	// Wired: TODO — no LLM-invocation latency source exists yet.
+	LatencyMs int64 `json:"latency_ms,omitempty" doc:"LLM invocation wall-clock latency (best-effort, currently always absent — no source)."`
+	// CostUSDEstimate is a decision-support cost estimate computed
+	// against the pricing seam (#1255, 1d). NOT invoice-grade. Treat
+	// absence as "not measured", not "free".
+	//
+	// Wired: TODO — pricing.Registry exists (PR #1272); finish-time
+	// wiring to compute cost from token counts is pending.
+	CostUSDEstimate float64 `json:"cost_usd_estimate,omitempty" doc:"Estimated invocation cost in USD (best-effort, currently always absent; see #1255 for pricing seam)."`
 }
 
 // IsEventPayload marks WorkerOperationEventPayload as an events.Payload variant.
@@ -132,15 +363,21 @@ func init() {
 	events.RegisterPayload(events.ControllerStopped, events.NoPayload{})
 	events.RegisterPayload(events.CitySuspended, events.NoPayload{})
 	events.RegisterPayload(events.CityResumed, events.NoPayload{})
-	events.RegisterPayload(events.CityCreated, CityCreatedPayload{})
-	events.RegisterPayload(events.CityReady, CityReadyPayload{})
-	events.RegisterPayload(events.CityInitFailed, CityInitFailedPayload{})
+	// Typed async request result events.
+	events.RegisterPayload(events.RequestResultCityCreate, CityCreateSucceededPayload{})
+	events.RegisterPayload(events.RequestResultCityUnregister, CityUnregisterSucceededPayload{})
+	events.RegisterPayload(events.RequestResultSessionCreate, SessionCreateSucceededPayload{})
+	events.RegisterPayload(events.RequestResultSessionMessage, SessionMessageSucceededPayload{})
+	events.RegisterPayload(events.RequestResultSessionSubmit, SessionSubmitSucceededPayload{})
+	events.RegisterPayload(events.RequestFailed, RequestFailedPayload{})
+
+	// Non-terminal city lifecycle events (diagnostics only).
+	events.RegisterPayload(events.CityCreated, CityLifecyclePayload{})
+	events.RegisterPayload(events.CityUnregisterRequested, CityLifecyclePayload{})
+
 	events.RegisterPayload(events.OrderFired, events.NoPayload{})
 	events.RegisterPayload(events.OrderCompleted, events.NoPayload{})
 	events.RegisterPayload(events.OrderFailed, events.NoPayload{})
 	events.RegisterPayload(events.ProviderSwapped, events.NoPayload{})
 	events.RegisterPayload(events.WorkerOperation, WorkerOperationEventPayload{})
-	events.RegisterPayload(events.CityUnregisterRequested, CityUnregisterRequestedPayload{})
-	events.RegisterPayload(events.CityUnregistered, CityUnregisteredPayload{})
-	events.RegisterPayload(events.CityUnregisterFailed, CityUnregisterFailedPayload{})
 }

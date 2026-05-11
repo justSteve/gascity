@@ -26,11 +26,16 @@ for you; the other methods require manual installation.
 | tmux | Yes | — | `brew install tmux` | `apt install tmux` | Session management |
 | jq | Yes | — | `brew install jq` | `apt install jq` | JSON processing |
 | git | Yes | — | (built-in) | (built-in) | Version control |
-| dolt | Yes | 1.86.1 | `brew install dolt` | [releases](https://github.com/dolthub/dolt/releases) | Beads data plane |
+| dolt | Yes | 1.86.2 or newer | `brew install dolt` | [releases](https://github.com/dolthub/dolt/releases) | Beads data plane |
 | bd (Beads CLI) | Yes | 1.0.0 | `brew install beads` | [releases](https://github.com/gastownhall/beads/releases) | Issue tracking |
 | flock | Yes | — | `brew install flock` | (built-in via util-linux) | File locking |
 | Go 1.25+ | Source only | 1.25 | `brew install go` | [golang.org](https://go.dev/dl/) | Compiler |
 | make | Source only | — | (built-in) | `apt install make` (or `build-essential`) | Drives `make install` |
+
+Use a final Dolt 1.86.2 or newer. Gas City's managed Dolt checks reject older
+and pre-release builds because they can miss the upstream GC/writer deadlock
+fix in dolthub/dolt commit `ccf7bde206`, which can hang `dolt_backup sync`
+under heavy write load.
 
 The exact versions CI pins are in [`deps.env`](https://github.com/gastownhall/gascity/blob/main/deps.env).
 
@@ -57,7 +62,8 @@ gc version
 <Warning>
 If you use Oh My Zsh with the `git` plugin, `gc` may already be an alias for
 `git commit --verbose`. Run `command gc version` once to bypass the alias. For
-a persistent fix, add `unalias gc 2>/dev/null` after Oh My Zsh loads in
+a persistent fix, add `unalias gc 2>/dev/null` or
+`zstyle ':omz:plugins:git' aliases no 'gc'` after Oh My Zsh loads in
 `~/.zshrc`, or put that line in a file such as
 `~/.oh-my-zsh/custom/gascity.zsh`.
 </Warning>
@@ -103,7 +109,7 @@ Release tarballs are published for every tagged version. Supported platforms:
 
 ```bash
 # Set the version you want (check https://github.com/gastownhall/gascity/releases)
-VERSION=0.13.3
+VERSION=1.1.0
 
 # Detect platform
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
@@ -122,6 +128,39 @@ sudo install -m 755 gc /usr/local/bin/gc
 
 # Verify
 gc version
+```
+
+### Verify release artifacts
+
+Homebrew verifies release checksums from the formula automatically. For direct
+downloads, verify the archive before installing it:
+
+```bash
+ARCHIVE="gascity_${VERSION}_${OS}_${ARCH}.tar.gz"
+CHECKSUMS="gascity_${VERSION}_checksums.txt"
+
+curl -fsSLO "https://github.com/gastownhall/gascity/releases/download/v${VERSION}/${CHECKSUMS}"
+grep "  ${ARCHIVE}$" "${CHECKSUMS}" > "${ARCHIVE}.sha256"
+
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256sum -c "${ARCHIVE}.sha256"
+else
+  shasum -a 256 -c "${ARCHIVE}.sha256"
+fi
+```
+
+Release archives are also published with GitHub artifact attestations. If you
+have the GitHub CLI installed, verify the downloaded archive against the
+`gastownhall/gascity` repository:
+
+```bash
+gh attestation verify "${ARCHIVE}" --repo gastownhall/gascity
+```
+
+Each release also includes an SPDX SBOM asset:
+
+```bash
+curl -fsSLO "https://github.com/gastownhall/gascity/releases/download/v${VERSION}/gascity-v${VERSION}.spdx.json"
 ```
 
 ### Upgrading a direct-download install
@@ -188,6 +227,11 @@ cd ~/my-city
 
 `gc init` registers the city with the supervisor and starts it automatically.
 See the [Quickstart](/getting-started/quickstart) for a complete walkthrough.
+
+Gas City ships a JSONL archive that snapshots every bead database for
+disaster recovery. By default it runs in local-only mode and keeps commits
+on this host. To enable off-box backup, see
+[JSONL archive push failures](/getting-started/troubleshooting#jsonl-archive-push-failures).
 
 ## Docs preview
 

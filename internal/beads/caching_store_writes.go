@@ -20,8 +20,9 @@ func (c *CachingStore) Create(b Bead) (Bead, error) {
 	}
 
 	c.mu.Lock()
-	c.noteMutationLocked(created.ID)
+	c.noteLocalMutationLocked(created.ID)
 	c.beads[created.ID] = cloneBead(created)
+	c.deps[created.ID] = depsFromBeadFields(created)
 	delete(c.dirty, created.ID)
 	delete(c.deletedSeq, created.ID)
 	c.markFreshLocked(time.Now())
@@ -50,8 +51,9 @@ func (c *CachingStore) Update(id string, opts UpdateOpts) error {
 	fresh = applyUpdateOptsToBead(fresh, opts)
 
 	c.mu.Lock()
-	c.noteMutationLocked(id)
+	c.noteLocalMutationLocked(id)
 	c.beads[id] = cloneBead(fresh)
+	c.deps[id] = depsFromBeadFields(fresh)
 	delete(c.dirty, id)
 	delete(c.deletedSeq, id)
 	c.markFreshLocked(time.Now())
@@ -79,7 +81,7 @@ func (c *CachingStore) Close(id string) error {
 	}
 
 	c.mu.Lock()
-	c.noteMutationLocked(id)
+	c.noteLocalMutationLocked(id)
 	if b, ok := c.beads[id]; ok {
 		b.Status = "closed"
 		c.beads[id] = b
@@ -100,6 +102,48 @@ func (c *CachingStore) Close(id string) error {
 
 	if found {
 		c.notifyChange("bead.closed", closed)
+	}
+	return nil
+}
+
+// Reopen marks a bead as open in the backing store and cache.
+func (c *CachingStore) Reopen(id string) error {
+	if err := c.backing.Reopen(id); err != nil {
+		return err
+	}
+
+	var reopened Bead
+	var found bool
+	if fresh, err := c.backing.Get(id); err == nil {
+		reopened = fresh
+		reopened.Status = "open"
+		found = true
+	} else if !errors.Is(err, ErrNotFound) {
+		c.recordProblem("refresh bead after reopen", fmt.Errorf("%s: %w", id, err))
+	}
+
+	c.mu.Lock()
+	c.noteLocalMutationLocked(id)
+	if b, ok := c.beads[id]; ok {
+		b.Status = "open"
+		c.beads[id] = b
+		delete(c.dirty, id)
+		delete(c.deletedSeq, id)
+		reopened = cloneBead(b)
+		found = true
+		c.markFreshLocked(time.Now())
+		c.updateStatsLocked()
+	} else if found {
+		c.beads[id] = cloneBead(reopened)
+		delete(c.dirty, id)
+		delete(c.deletedSeq, id)
+		c.markFreshLocked(time.Now())
+		c.updateStatsLocked()
+	}
+	c.mu.Unlock()
+
+	if found {
+		c.notifyChange("bead.updated", reopened)
 	}
 	return nil
 }
@@ -130,7 +174,7 @@ func (c *CachingStore) CloseAll(ids []string, metadata map[string]string) (int, 
 
 	notifications := make([]cacheNotification, 0, len(refreshed))
 	c.mu.Lock()
-	c.noteMutationLocked(ids...)
+	c.noteLocalMutationLocked(ids...)
 	if refreshErr != nil {
 		c.recordProblemLocked("close-all refresh", refreshErr)
 	}
@@ -161,12 +205,24 @@ func (c *CachingStore) CloseAll(ids []string, metadata map[string]string) (int, 
 
 // SetMetadata sets a single metadata key-value on a bead.
 func (c *CachingStore) SetMetadata(id, key, value string) error {
+	// Idempotence: if the cached bead already has metadata[key] == value,
+	// the backing call is a no-op semantically. Skipping it avoids the
+	// bd subprocess invocation and — crucially — avoids firing bd's
+	// on_update hook, which calls "gc event emit bead.updated" and
+	// appends a line to the city's events.jsonl. Reconciler tick logic
+	// repeatedly writes the same heartbeat / deferral fields every ~2s,
+	// producing thousands of no-op events per hour. The cache is the
+	// supervisor's authoritative read source, so a value-match here is
+	// a value-match in the store.
+	if c.metadataAlreadyMatchesCached(id, map[string]string{key: value}) {
+		return nil
+	}
 	if err := c.backing.SetMetadata(id, key, value); err != nil {
 		return err
 	}
 
 	c.mu.Lock()
-	c.noteMutationLocked(id)
+	c.noteLocalMutationLocked(id)
 	if b, ok := c.beads[id]; ok {
 		if b.Metadata == nil {
 			b.Metadata = make(map[string]string)
@@ -184,12 +240,24 @@ func (c *CachingStore) SetMetadata(id, key, value string) error {
 
 // SetMetadataBatch sets multiple metadata key-values on a bead.
 func (c *CachingStore) SetMetadataBatch(id string, kvs map[string]string) error {
+	if len(kvs) == 0 {
+		return nil
+	}
+	// Idempotence: see SetMetadata. If every kv pair already matches the
+	// cached bead's metadata, skip the backing write — no bd subprocess,
+	// no on_update hook fire, no events.jsonl entry. Reconciler ticks
+	// re-stamp deferral timestamps and other "I observed this" markers
+	// on every cycle; without this guard each cycle generates a
+	// bead.updated event even when nothing changed.
+	if c.metadataAlreadyMatchesCached(id, kvs) {
+		return nil
+	}
 	if err := c.backing.SetMetadataBatch(id, kvs); err != nil {
 		return err
 	}
 
 	c.mu.Lock()
-	c.noteMutationLocked(id)
+	c.noteLocalMutationLocked(id)
 	if b, ok := c.beads[id]; ok {
 		if b.Metadata == nil {
 			b.Metadata = make(map[string]string, len(kvs))
@@ -207,6 +275,41 @@ func (c *CachingStore) SetMetadataBatch(id string, kvs map[string]string) error 
 	return nil
 }
 
+// metadataAlreadyMatchesCached returns true when the cache holds a primed
+// copy of the bead and every key/value in kvs is already present with the
+// same value. A cache miss returns false (we cannot prove no-op), so the
+// caller falls through to the backing write. Empty maps (no keys) match
+// trivially, but callers should handle len==0 explicitly to avoid acquiring
+// the lock for a guaranteed no-op.
+func (c *CachingStore) metadataAlreadyMatchesCached(id string, kvs map[string]string) bool {
+	if id == "" {
+		return false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	b, ok := c.beads[id]
+	if !ok {
+		return false
+	}
+	if b.Metadata == nil {
+		// Cache has the bead but no metadata map — any non-empty value
+		// would be a write; an empty value (clearing a never-set key)
+		// is already the desired state.
+		for _, v := range kvs {
+			if v != "" {
+				return false
+			}
+		}
+		return true
+	}
+	for k, v := range kvs {
+		if b.Metadata[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
 // DepAdd adds a dependency and updates the cache.
 func (c *CachingStore) DepAdd(issueID, dependsOnID, depType string) error {
 	if err := c.backing.DepAdd(issueID, dependsOnID, depType); err != nil {
@@ -214,7 +317,17 @@ func (c *CachingStore) DepAdd(issueID, dependsOnID, depType string) error {
 	}
 
 	c.mu.Lock()
-	c.noteMutationLocked(issueID)
+	c.noteLocalMutationLocked(issueID)
+	if !c.depsComplete {
+		if _, known := c.deps[issueID]; !known {
+			delete(c.dirty, issueID)
+			delete(c.deletedSeq, issueID)
+			c.markFreshLocked(time.Now())
+			c.updateStatsLocked()
+			c.mu.Unlock()
+			return nil
+		}
+	}
 	deps := c.deps[issueID]
 	for i, d := range deps {
 		if d.DependsOnID == dependsOnID {
@@ -244,7 +357,17 @@ func (c *CachingStore) DepRemove(issueID, dependsOnID string) error {
 	}
 
 	c.mu.Lock()
-	c.noteMutationLocked(issueID)
+	c.noteLocalMutationLocked(issueID)
+	if !c.depsComplete {
+		if _, known := c.deps[issueID]; !known {
+			delete(c.dirty, issueID)
+			delete(c.deletedSeq, issueID)
+			c.markFreshLocked(time.Now())
+			c.updateStatsLocked()
+			c.mu.Unlock()
+			return nil
+		}
+	}
 	deps := c.deps[issueID]
 	for i, d := range deps {
 		if d.DependsOnID == dependsOnID {
@@ -267,11 +390,12 @@ func (c *CachingStore) Delete(id string) error {
 	}
 
 	c.mu.Lock()
-	seq := c.noteMutationLocked(id)
+	seq := c.noteLocalMutationLocked(id)
 	delete(c.beads, id)
 	delete(c.deps, id)
 	delete(c.dirty, id)
 	delete(c.beadSeq, id)
+	delete(c.localBeadAt, id)
 	c.deletedSeq[id] = seq
 	c.markFreshLocked(time.Now())
 	c.updateStatsLocked()

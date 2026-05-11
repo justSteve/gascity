@@ -18,12 +18,12 @@ import (
 // Helpers
 // ---------------------------------------------------------------------------
 
-// setupCity creates a minimal city directory with city.toml and .gc/.
+// setupCity creates a minimal city directory with city.toml and the runtime scaffold.
 // Returns the absolute path to the city root.
 func setupCity(t *testing.T, name string) string {
 	t.Helper()
 	dir := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(dir, ".gc"), 0o755); err != nil {
+	if err := ensureCityScaffold(dir); err != nil {
 		t.Fatal(err)
 	}
 	toml := "[workspace]\nname = \"" + name + "\"\n\n[[agent]]\nname = \"mayor\"\n"
@@ -549,7 +549,7 @@ func TestRigAnywhere_RigAddName(t *testing.T) {
 		}
 
 		var stdout, stderr bytes.Buffer
-		code := doRigAdd(fsys.OSFS{}, cityPath, rigDir, nil, "custom-name", "", false, false, &stdout, &stderr)
+		code := doRigAdd(fsys.OSFS{}, cityPath, rigDir, nil, "custom-name", "", "", false, false, &stdout, &stderr)
 		if code != 0 {
 			t.Fatalf("doRigAdd = %d, stderr: %s", code, stderr.String())
 		}
@@ -584,7 +584,7 @@ func TestRigAnywhere_RigAddName(t *testing.T) {
 		}
 
 		var stdout, stderr bytes.Buffer
-		code := doRigAdd(fsys.OSFS{}, cityPath, rigDir, nil, "", "", false, false, &stdout, &stderr)
+		code := doRigAdd(fsys.OSFS{}, cityPath, rigDir, nil, "", "", "", false, false, &stdout, &stderr)
 		if code != 0 {
 			t.Fatalf("doRigAdd = %d, stderr: %s", code, stderr.String())
 		}
@@ -612,7 +612,7 @@ func TestRigAnywhere_RigAddName(t *testing.T) {
 
 		// First add succeeds.
 		var stdout1, stderr1 bytes.Buffer
-		code := doRigAdd(fsys.OSFS{}, city1, rigDir1, nil, "shared-name", "", false, false, &stdout1, &stderr1)
+		code := doRigAdd(fsys.OSFS{}, city1, rigDir1, nil, "shared-name", "", "", false, false, &stdout1, &stderr1)
 		if code != 0 {
 			t.Fatalf("first doRigAdd = %d, stderr: %s", code, stderr1.String())
 		}
@@ -627,7 +627,7 @@ func TestRigAnywhere_RigAddName(t *testing.T) {
 			t.Fatal(err)
 		}
 		var stdout2, stderr2 bytes.Buffer
-		code = doRigAdd(fsys.OSFS{}, city2, rigDir2, nil, "shared-name", "", false, false, &stdout2, &stderr2)
+		code = doRigAdd(fsys.OSFS{}, city2, rigDir2, nil, "shared-name", "", "", false, false, &stdout2, &stderr2)
 		if code != 0 {
 			t.Fatalf("second doRigAdd = %d, stderr: %s", code, stderr2.String())
 		}
@@ -656,7 +656,7 @@ func TestRigAnywhere_RigAddSiteBindingSync(t *testing.T) {
 		}
 
 		var stdout, stderr bytes.Buffer
-		code := doRigAdd(fsys.OSFS{}, cityPath, rigDir, nil, "", "", false, false, &stdout, &stderr)
+		code := doRigAdd(fsys.OSFS{}, cityPath, rigDir, nil, "", "", "", false, false, &stdout, &stderr)
 		if code != 0 {
 			t.Fatalf("doRigAdd = %d, stderr: %s", code, stderr.String())
 		}
@@ -692,14 +692,14 @@ func TestRigAnywhere_RigAddSiteBindingSync(t *testing.T) {
 		writeRigAnywhereCityToml(t, cityPath, toml)
 
 		var stdout1, stderr1 bytes.Buffer
-		code := doRigAdd(fsys.OSFS{}, cityPath, rigDir, nil, "", "", false, false, &stdout1, &stderr1)
+		code := doRigAdd(fsys.OSFS{}, cityPath, rigDir, nil, "", "", "", false, false, &stdout1, &stderr1)
 		if code != 0 {
 			t.Fatalf("first doRigAdd = %d, stderr: %s", code, stderr1.String())
 		}
 
 		// Re-add should succeed without duplicates.
 		var stdout2, stderr2 bytes.Buffer
-		code = doRigAdd(fsys.OSFS{}, cityPath, rigDir, nil, "", "", false, false, &stdout2, &stderr2)
+		code = doRigAdd(fsys.OSFS{}, cityPath, rigDir, nil, "", "", "", false, false, &stdout2, &stderr2)
 		if code != 0 {
 			t.Fatalf("re-add doRigAdd = %d, stderr: %s", code, stderr2.String())
 		}
@@ -738,7 +738,7 @@ func TestRigAnywhere_RigAddBeadsEnv(t *testing.T) {
 		}
 
 		var stdout, stderr bytes.Buffer
-		code := doRigAdd(fsys.OSFS{}, cityPath, rigDir, nil, "", "", false, false, &stdout, &stderr)
+		code := doRigAdd(fsys.OSFS{}, cityPath, rigDir, nil, "", "", "", false, false, &stdout, &stderr)
 		if code != 0 {
 			t.Fatalf("doRigAdd = %d, stderr: %s", code, stderr.String())
 		}
@@ -768,7 +768,7 @@ func TestRigAnywhere_RigAddBeadsEnv(t *testing.T) {
 
 		// First add with city1.
 		var stdout1, stderr1 bytes.Buffer
-		code := doRigAdd(fsys.OSFS{}, city1, rigDir, nil, "", "", false, false, &stdout1, &stderr1)
+		code := doRigAdd(fsys.OSFS{}, city1, rigDir, nil, "", "", "", false, false, &stdout1, &stderr1)
 		if code != 0 {
 			t.Fatalf("first doRigAdd = %d, stderr: %s", code, stderr1.String())
 		}
@@ -787,7 +787,7 @@ func TestRigAnywhere_RigAddBeadsEnv(t *testing.T) {
 		writeRigAnywhereCityToml(t, city2, toml2)
 
 		var stdout2, stderr2 bytes.Buffer
-		code = doRigAdd(fsys.OSFS{}, city2, rigDir, nil, "", "", false, false, &stdout2, &stderr2)
+		code = doRigAdd(fsys.OSFS{}, city2, rigDir, nil, "", "", "", false, false, &stdout2, &stderr2)
 		if code != 0 {
 			t.Fatalf("second doRigAdd = %d, stderr: %s", code, stderr2.String())
 		}
@@ -1306,6 +1306,237 @@ func TestRigAnywhere_ResolveRigToContext(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "loading registered city rig bindings") {
 			t.Fatalf("error = %q, want registered binding load error", err)
+		}
+	})
+
+	// Regression: gc stop (and other commands that scan registered rig
+	// bindings) must not abort when a sibling city's directory has been
+	// deleted out from under the registry. Resolution still succeeds on
+	// the healthy target and registeredRigBindingsByPath reports the
+	// stale entry as structured data so only explicit-rig-resolution
+	// callers (not opportunistic probes) need to warn about it.
+	t.Run("stale_sibling_directory_is_skipped_with_warning", func(t *testing.T) {
+		gcHome := t.TempDir()
+		t.Setenv("GC_HOME", gcHome)
+
+		goodCity := setupCity(t, "stale-sibling-good")
+		rigDir := filepath.Join(t.TempDir(), "stale-sibling-rig")
+		if err := os.MkdirAll(rigDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		registerRigBindingForResolution(t, gcHome, goodCity, "stale-sibling-good", "stale-sibling-rig", rigDir)
+
+		// Register a second city, then delete its directory to simulate
+		// "gc stop ~/my-city" after the sibling city was rm -rf'd.
+		staleDir := filepath.Join(t.TempDir(), "vanished-city")
+		if err := os.MkdirAll(filepath.Join(staleDir, ".gc"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(staleDir, "city.toml"),
+			[]byte("[workspace]\nname = \"stale-sibling-bad\"\n\n[[agent]]\nname = \"mayor\"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		registerCityForRigResolution(t, gcHome, staleDir, "stale-sibling-bad")
+		if err := os.RemoveAll(staleDir); err != nil {
+			t.Fatal(err)
+		}
+
+		ctx, err := resolveContextFromPath(rigDir)
+		if err != nil {
+			t.Fatalf("resolveContextFromPath error: %v (want success with stale sibling skipped)", err)
+		}
+		assertSameTestPath(t, ctx.CityPath, goodCity)
+		if ctx.RigName != "stale-sibling-rig" {
+			t.Errorf("RigName = %q, want %q", ctx.RigName, "stale-sibling-rig")
+		}
+
+		// registeredRigBindingsByPath returns stale entries as structured
+		// data; callers decide whether to emit a user-facing warning. This
+		// asserts the diagnostic is available without coupling the test to
+		// a particular stderr routing scheme.
+		_, stale, err := registeredRigBindingsByPath(rigDir, true)
+		if err != nil {
+			t.Fatalf("registeredRigBindingsByPath error: %v", err)
+		}
+		if len(stale) == 0 {
+			t.Fatal("expected a stale-registered-city entry, got none")
+		}
+		var found bool
+		for _, s := range stale {
+			if strings.Contains(s.Label, "stale-sibling-bad") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("stale = %+v, want an entry mentioning stale-sibling-bad", stale)
+		}
+
+		// The helper renders the structured list to a command's stderr.
+		var warnings bytes.Buffer
+		emitStaleRegisteredCityWarnings(&warnings, stale)
+		warn := warnings.String()
+		if !strings.Contains(warn, "stale-sibling-bad") {
+			t.Errorf("warning = %q, want it to mention the stale city name", warn)
+		}
+		if !strings.Contains(warn, "city.toml missing") {
+			t.Errorf("warning = %q, want it to explain city.toml is missing", warn)
+		}
+		if !strings.Contains(warn, filepath.Join(staleDir, "city.toml")) {
+			t.Errorf("warning = %q, want it to mention the missing city.toml path", warn)
+		}
+	})
+
+	// Regression: the stale-entry check handles ENOENT from the config-load
+	// path itself. A registered city whose directory exists but whose city.toml
+	// is missing must still be skipped rather than abort the resolver.
+	t.Run("stale_sibling_city_toml_missing_hits_load_path", func(t *testing.T) {
+		gcHome := t.TempDir()
+		t.Setenv("GC_HOME", gcHome)
+
+		goodCity := setupCity(t, "load-path-good")
+		rigDir := filepath.Join(t.TempDir(), "load-path-rig")
+		if err := os.MkdirAll(rigDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		registerRigBindingForResolution(t, gcHome, goodCity, "load-path-good", "load-path-rig", rigDir)
+
+		// Register a second city whose directory exists but whose
+		// city.toml was never created. The load path (not a Stat
+		// pre-check) has to handle ENOENT here.
+		emptyDir := filepath.Join(t.TempDir(), "empty-city")
+		if err := os.MkdirAll(filepath.Join(emptyDir, ".gc"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		registerCityForRigResolution(t, gcHome, emptyDir, "empty-city")
+
+		ctx, err := resolveContextFromPath(rigDir)
+		if err != nil {
+			t.Fatalf("resolveContextFromPath error: %v (want success with ENOENT on load path)", err)
+		}
+		assertSameTestPath(t, ctx.CityPath, goodCity)
+
+		_, stale, err := registeredRigBindingsByPath(rigDir, true)
+		if err != nil {
+			t.Fatalf("registeredRigBindingsByPath error: %v", err)
+		}
+		var found bool
+		for _, s := range stale {
+			if strings.Contains(s.Label, "empty-city") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("stale = %+v, want an entry mentioning empty-city", stale)
+		}
+	})
+
+	t.Run("registered_city_with_missing_include_fails_closed_not_stale", func(t *testing.T) {
+		gcHome := t.TempDir()
+		t.Setenv("GC_HOME", gcHome)
+
+		goodCity := setupCity(t, "missing-include-good")
+		rigDir := filepath.Join(t.TempDir(), "missing-include-rig")
+		if err := os.MkdirAll(rigDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		registerRigBindingForResolution(t, gcHome, goodCity, "missing-include-good", "missing-include-rig", rigDir)
+
+		brokenCity := setupCity(t, "missing-include-broken")
+		if err := os.WriteFile(filepath.Join(brokenCity, "city.toml"), []byte(`
+include = ["missing.toml"]
+
+[workspace]
+name = "missing-include-broken"
+
+[[agent]]
+name = "missing-include-agent"
+`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		registerCityForRigResolution(t, gcHome, brokenCity, "missing-include-broken")
+
+		_, stale, err := registeredRigBindingsByPath(rigDir, true)
+		if err == nil {
+			t.Fatal("registeredRigBindingsByPath should fail closed on missing include")
+		}
+		if !strings.Contains(err.Error(), "loading registered city rig bindings") {
+			t.Fatalf("error = %q, want registered binding load error", err)
+		}
+		if !strings.Contains(err.Error(), "missing.toml") {
+			t.Fatalf("error = %q, want missing include path", err)
+		}
+		for _, s := range stale {
+			if strings.Contains(s.Label, "missing-include-broken") {
+				t.Fatalf("stale = %+v, missing include must not be reported as stale", stale)
+			}
+		}
+	})
+
+	t.Run("path_lookup_error_preserves_stale_entries", func(t *testing.T) {
+		gcHome := t.TempDir()
+		t.Setenv("GC_HOME", gcHome)
+
+		goodCity := setupCity(t, "path-stale-error-good")
+		rigDir := filepath.Join(t.TempDir(), "path-stale-error-rig")
+		if err := os.MkdirAll(rigDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		registerRigBindingForResolution(t, gcHome, goodCity, "path-stale-error-good", "path-stale-error-rig", rigDir)
+
+		staleDir := filepath.Join(t.TempDir(), "path-stale-error-vanished")
+		if err := os.MkdirAll(filepath.Join(staleDir, ".gc"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(staleDir, "city.toml"), []byte("[workspace]\nname = \"path-stale-error-vanished\"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		registerCityForRigResolution(t, gcHome, staleDir, "path-stale-error-vanished")
+		if err := os.RemoveAll(staleDir); err != nil {
+			t.Fatal(err)
+		}
+
+		badCity := setupCity(t, "path-stale-error-bad")
+		if err := os.WriteFile(config.SiteBindingPath(badCity), []byte("[[rig]\nname = \"broken\"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		registerCityForRigResolution(t, gcHome, badCity, "path-stale-error-bad")
+
+		_, stale, err := registeredRigBindingsByPath(rigDir, true)
+		if err == nil {
+			t.Fatal("registeredRigBindingsByPath should fail closed on the malformed site binding")
+		}
+		var found bool
+		for _, s := range stale {
+			if strings.Contains(s.Label, "path-stale-error-vanished") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("stale = %+v, want vanished city preserved on error", stale)
+		}
+	})
+
+	// Regression: emitStaleRegisteredCityWarnings dedupes by Label so a
+	// command that invokes registeredRigBindings twice (e.g.
+	// resolveRigToContext tries both name and path lookups) emits each
+	// stale entry at most once.
+	t.Run("emit_stale_warnings_deduplicates_by_label", func(t *testing.T) {
+		stale := []staleRegisteredCity{
+			{Label: "city-a", Path: "/tmp/a"},
+			{Label: "city-b", Path: "/tmp/b"},
+			{Label: "city-a", Path: "/tmp/a"}, // duplicate from a second scan
+		}
+		var out bytes.Buffer
+		emitStaleRegisteredCityWarnings(&out, stale)
+		got := out.String()
+		if strings.Count(got, "city-a") != 1 {
+			t.Errorf("city-a should appear once, got %d in %q", strings.Count(got, "city-a"), got)
+		}
+		if strings.Count(got, "city-b") != 1 {
+			t.Errorf("city-b should appear once, got %d in %q", strings.Count(got, "city-b"), got)
 		}
 	})
 

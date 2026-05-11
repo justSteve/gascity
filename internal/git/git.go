@@ -66,6 +66,31 @@ func (g *Git) DefaultBranch() (string, error) {
 	return strings.TrimPrefix(ref, "refs/remotes/origin/"), nil
 }
 
+// ProbeDefaultBranch returns the repo's mainline branch name with a richer
+// fallback chain than DefaultBranch:
+//  1. refs/remotes/origin/HEAD symref (the configured default)
+//  2. the currently checked-out branch (when origin/HEAD is unset, the
+//     first branch is usually the mainline)
+//  3. empty string (caller decides)
+//
+// Use this at registration time (gc rig add) where we want to record the
+// repo's actual mainline rather than a generic "main" placeholder.
+func (g *Git) ProbeDefaultBranch() string {
+	if out, err := g.run("symbolic-ref", "refs/remotes/origin/HEAD"); err == nil {
+		ref := strings.TrimSpace(out)
+		if branch := strings.TrimPrefix(ref, "refs/remotes/origin/"); branch != "" {
+			return branch
+		}
+	}
+	if branch, err := g.CurrentBranch(); err == nil {
+		branch = strings.TrimSpace(branch)
+		if branch != "" && branch != "HEAD" {
+			return branch
+		}
+	}
+	return ""
+}
+
 // WorktreeRemove removes a worktree. If force is true, removes even with
 // uncommitted changes.
 func (g *Git) WorktreeRemove(path string, force bool) error {
@@ -103,21 +128,43 @@ func (g *Git) HasUncommittedWork() bool {
 // HasUnpushedCommits reports whether HEAD has commits not reachable from
 // any remote tracking branch. Used as a safety check before removing a
 // worktree — unpushed commits represent completed work that would be lost.
+// If the probe fails, it returns true to fail closed.
 func (g *Git) HasUnpushedCommits() bool {
+	has, err := g.HasUnpushedCommitsResult()
+	if err != nil {
+		return true
+	}
+	return has
+}
+
+// HasUnpushedCommitsResult is like HasUnpushedCommits but preserves git
+// probe errors for callers that need to expose the precise failure reason.
+func (g *Git) HasUnpushedCommitsResult() (bool, error) {
 	out, err := g.run("log", "HEAD", "--oneline", "--not", "--remotes")
 	if err != nil {
-		return false // can't determine; assume clean
+		return false, fmt.Errorf("checking unpushed commits: %w", err)
 	}
-	return strings.TrimSpace(out) != ""
+	return strings.TrimSpace(out) != "", nil
 }
 
 // HasStashes reports whether the repository has stashed work.
+// If the probe fails, it returns true to fail closed.
 func (g *Git) HasStashes() bool {
+	has, err := g.HasStashesResult()
+	if err != nil {
+		return true
+	}
+	return has
+}
+
+// HasStashesResult is like HasStashes but preserves git probe errors for
+// callers that need to expose the precise failure reason.
+func (g *Git) HasStashesResult() (bool, error) {
 	out, err := g.run("stash", "list")
 	if err != nil {
-		return false // can't determine; assume clean
+		return false, fmt.Errorf("checking stashes: %w", err)
 	}
-	return strings.TrimSpace(out) != ""
+	return strings.TrimSpace(out) != "", nil
 }
 
 // SubmoduleInit initializes and updates submodules recursively.

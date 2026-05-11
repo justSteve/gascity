@@ -3,12 +3,17 @@
 package beads
 
 import (
+	"context"
 	"errors"
 	"time"
 )
 
 // ErrNotFound is returned when a bead ID does not exist in the store.
 var ErrNotFound = errors.New("bead not found")
+
+// ErrParentProjectionSuperseded reports that a parent update was overtaken by a
+// concurrent reparent before the caller's projection wait could converge.
+var ErrParentProjectionSuperseded = errors.New("parent projection superseded by concurrent update")
 
 // Bead is a single unit of work in Gas City. Everything is a bead: tasks,
 // mail, molecules, convoys.
@@ -85,6 +90,7 @@ var readyExcludeTypes = map[string]bool{
 	"merge-request": true, // processed by automation
 	"gate":          true, // async wait conditions
 	"molecule":      true, // workflow containers
+	"step":          true, // non-root formula steps; parent molecule is the actionable unit (#1039)
 	"message":       true, // mail/communication items
 	"session":       true, // runtime/session continuity beads, never actionable work
 	"agent":         true, // identity/state tracking beads
@@ -148,6 +154,10 @@ type Store interface {
 	// does not exist. Closing an already-closed bead is a no-op.
 	Close(id string) error
 
+	// Reopen sets a closed bead's status back to "open". Returns ErrNotFound
+	// if the ID does not exist.
+	Reopen(id string) error
+
 	// CloseAll closes multiple beads in a single batch operation and sets
 	// the given metadata on each. Already-closed beads are skipped.
 	// Returns the number of beads actually closed.
@@ -167,8 +177,8 @@ type Store interface {
 	// Ready returns open, unblocked beads representing actionable work.
 	// Infrastructure types (molecule, message, gate, etc.) are excluded
 	// to match the bd CLI's GetReadyWork semantics. Same ordering note
-	// as List.
-	Ready() ([]Bead, error)
+	// as List. Pass ReadyQuery to constrain the ready lookup.
+	Ready(query ...ReadyQuery) ([]Bead, error)
 
 	// Legacy helper; prefer List with ListQuery in new code.
 	// Children returns all beads whose ParentID matches the given ID,
@@ -225,4 +235,15 @@ type Store interface {
 	// query: "down" returns what this bead depends on (default),
 	// "up" returns what depends on this bead.
 	DepList(id, direction string) ([]Dep, error)
+}
+
+// ParentProjectionWaiter is an optional capability for stores whose
+// parent-child listing path may lag a successful parent update. Callers that
+// need strict read-after-write semantics for parent projections can type-assert
+// this interface after a successful Update.
+type ParentProjectionWaiter interface {
+	// WaitForParentProjection blocks until the store's parent-child listing
+	// view reflects a reparent from oldParentID to newParentID for id, or
+	// returns an error if the projection does not converge.
+	WaitForParentProjection(ctx context.Context, id, oldParentID, newParentID string) error
 }

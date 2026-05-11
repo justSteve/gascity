@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -14,6 +15,8 @@ import (
 	"github.com/BurntSushi/toml"
 	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/fsys"
+	"github.com/gastownhall/gascity/internal/orders"
+	"github.com/gastownhall/gascity/internal/pricing"
 )
 
 // validAgentName matches names safe for use in session identifiers.
@@ -30,17 +33,50 @@ const (
 	// ControlDispatcherAgentName is the built-in deterministic control lane for
 	// graph.v2 workflow control beads.
 	ControlDispatcherAgentName = "control-dispatcher"
+	// controlDispatcherDefaultTracePathExpr is the watcher-safe default trace
+	// target for the control-dispatcher. The controller ignores the hidden .gc
+	// subtree recursively, so defaults must stay under it to avoid self-triggered
+	// config-watch churn. The trace intentionally stays a flat, well-known file
+	// under .gc/runtime because operators and tests tail a single canonical path.
+	//
+	// Per-dispatcher distinction (closes #1650) is layered on top in
+	// cmd/gc/template_resolve.go at session-spawn time: agentEnv there
+	// overrides GC_CONTROL_DISPATCHER_TRACE_DEFAULT with a per-name absolute
+	// path, which the ${GC_CONTROL_DISPATCHER_TRACE_DEFAULT:-...} expression
+	// below consumes. The shell template stays uniform so the trust decision
+	// lives in Go.
+	controlDispatcherDefaultTracePathExpr = `${GC_CONTROL_DISPATCHER_TRACE_DEFAULT:-${GC_CITY}/` + citylayout.RuntimeDataRoot + `/control-dispatcher-trace.log}`
+	// controlDispatcherTraceInit exports the resolved trace path. Explicit
+	// GC_WORKFLOW_TRACE overrides win first; otherwise the runtime injects a
+	// precomputed watcher-safe default trace path for the current city/session.
+	controlDispatcherTraceInit = `export GC_WORKFLOW_TRACE="${GC_WORKFLOW_TRACE:-` + controlDispatcherDefaultTracePathExpr + `}"`
+	// controlDispatcherTraceDirInit creates the parent directory for the
+	// resolved trace path. This preserves explicit GC_WORKFLOW_TRACE overrides
+	// instead of unconditionally depending on the default runtime root.
+	controlDispatcherTraceDirInit = `trace_dir="${GC_WORKFLOW_TRACE%/*}"; if [ "$trace_dir" = "$GC_WORKFLOW_TRACE" ]; then trace_dir="."; elif [ -z "$trace_dir" ]; then trace_dir="/"; fi; mkdir -p "$trace_dir"`
 	// ControlDispatcherStartCommand runs the built-in control-dispatcher worker.
 	// Wrapped in `sh -c` so any appended prompt suffix is ignored as $0.
 	// The control lane is kept resident and blocks on workflow-relevant city
 	// events instead of exiting after each one-shot drain.
-	ControlDispatcherStartCommand = `sh -c 'export GC_WORKFLOW_TRACE="${GC_WORKFLOW_TRACE:-${GC_CITY}/control-dispatcher-trace.log}"; exec "${GC_BIN:-gc}" convoy control --serve --follow ` + ControlDispatcherAgentName + `'`
+	//
+	// The trace log default is under .gc/runtime/ so it sits inside the
+	// controller's fsnotify exclusion (cmd/gc/controller.go shouldIgnoreConfigWatchEvent
+	// excludes the .gc and .beads path segments). Placing it at city root
+	// caused every append to fire markDirty() through the watcher debouncer,
+	// which kept the patrol loop in continuous reconciliation and blew patrol
+	// cycle duration well past the configured patrol_interval. See
+	// engdocs/design/session-reconciler-tracing.md for the canonical
+	// .gc/runtime/ convention for trace data.
+	ControlDispatcherStartCommand = `sh -c '` + controlDispatcherTraceInit + `; ` + controlDispatcherTraceDirInit + `; exec "${GC_BIN:-gc}" convoy control --serve --follow ` + ControlDispatcherAgentName + `'`
 )
 
 // ControlDispatcherStartCommandFor returns the start command for a
-// control-dispatcher agent with the given qualified name.
+// control-dispatcher agent with the given qualified name. The shell-level
+// trace default is uniform across dispatchers; per-dispatcher distinction
+// (closes #1650) is injected via agentEnv in cmd/gc/template_resolve.go at
+// session-spawn time so the trust decision happens in Go.
 func ControlDispatcherStartCommandFor(qualifiedName string) string {
-	return `sh -c 'export GC_WORKFLOW_TRACE="${GC_WORKFLOW_TRACE:-${GC_CITY}/control-dispatcher-trace.log}"; exec "${GC_BIN:-gc}" convoy control --serve --follow ` + qualifiedName + `'`
+	return `sh -c '` + controlDispatcherTraceInit + `; ` + controlDispatcherTraceDirInit + `; exec "${GC_BIN:-gc}" convoy control --serve --follow ` + qualifiedName + `'`
 }
 
 // BindingQualifiedName returns the binding-qualified agent identity without a
@@ -50,6 +86,16 @@ func (a *Agent) BindingQualifiedName() string {
 		return a.Name
 	}
 	return a.BindingName + "." + a.Name
+}
+
+// BindingPrefix returns the import binding prefix for route/template
+// interpolation, including the trailing dot when a binding is present.
+func (a *Agent) BindingPrefix() string {
+	bindingName := strings.TrimSpace(a.BindingName)
+	if bindingName == "" {
+		return ""
+	}
+	return bindingName + "."
 }
 
 // QualifiedName returns the agent's canonical identity, including the rig
@@ -161,6 +207,9 @@ type City struct {
 	SessionSleep SessionSleepConfig `toml:"session_sleep,omitempty"`
 	// Convergence configures convergence loop limits.
 	Convergence ConvergenceConfig `toml:"convergence,omitempty"`
+	// Doctor configures gc doctor thresholds and policy toggles
+	// (worktree size warnings, nested-worktree auto-prune).
+	Doctor DoctorConfig `toml:"doctor,omitempty"`
 	// Services declares workspace-owned HTTP services mounted on the
 	// controller edge under /svc/{name}.
 	Services []Service `toml:"service,omitempty"`
@@ -285,6 +334,17 @@ type City struct {
 	// ResolvedProviders is the eager-resolution cache populated by
 	// BuildResolvedProviderCache after compose + patch. Runtime-only.
 	ResolvedProviders map[string]ResolvedProvider `toml:"-" json:"-"`
+	// Pricing holds per-model cost rate overrides keyed by (provider, model).
+	// City-level entries override pack-level entries which override the
+	// defaults shipped with the pricing package. See internal/pricing for the
+	// estimation seam introduced by issue #1255 (1d).
+	Pricing []pricing.ModelPricing `toml:"pricing,omitempty"`
+	// PackPricing preserves the pack-level pricing layer before Pricing is
+	// flattened for legacy callers. Runtime-only.
+	PackPricing []pricing.ModelPricing `toml:"-" json:"-"`
+	// CityPricing preserves the city-level pricing layer before Pricing is
+	// flattened for legacy callers. Runtime-only.
+	CityPricing []pricing.ModelPricing `toml:"-" json:"-"`
 }
 
 // NamedSession defines a canonical persistent session backed by an agent
@@ -403,6 +463,12 @@ type Rig struct {
 	Path string `toml:"path,omitempty"`
 	// Prefix overrides the auto-derived bead ID prefix for this rig.
 	Prefix string `toml:"prefix,omitempty"`
+	// DefaultBranch is the rig repository's mainline branch (e.g. "main",
+	// "master", "develop"). When set, routing formulas use this as the
+	// default merge target instead of probing origin/HEAD at sling time.
+	// Captured by `gc rig add` from the rig's git config; set manually for
+	// rigs whose mainline isn't reachable via origin/HEAD.
+	DefaultBranch string `toml:"default_branch,omitempty"`
 	// Suspended prevents the reconciler from spawning agents in this rig. Toggle with gc rig suspend/resume.
 	Suspended bool `toml:"suspended,omitempty"`
 	// FormulasDir is a rig-local formula directory (Layer 4). Overrides
@@ -511,8 +577,11 @@ type AgentOverride struct {
 	OverlayDir *string `toml:"overlay_dir,omitempty"`
 	// DefaultSlingFormula overrides the default sling formula.
 	DefaultSlingFormula *string `toml:"default_sling_formula,omitempty"`
-	// InjectFragments overrides the agent's inject_fragments list.
-	InjectFragments []string `toml:"inject_fragments,omitempty"`
+	// InjectFragments overrides the agent's inject_fragments list. Leave this
+	// field unset to keep inherited fragments; JSON callers may send null for
+	// the same no-op. Set an empty list to clear fragments; set a populated
+	// list to replace fragments.
+	InjectFragments *[]string `toml:"inject_fragments,omitempty"`
 	// AppendFragments appends named template fragments to this agent's rendered
 	// prompt. It is the V2 spelling for per-agent fragment selection.
 	AppendFragments []string `toml:"append_fragments,omitempty"`
@@ -547,7 +616,8 @@ type AgentOverride struct {
 	MaxActiveSessions *int `toml:"max_active_sessions,omitempty"`
 	// MinActiveSessions overrides the minimum number of sessions to keep alive.
 	MinActiveSessions *int `toml:"min_active_sessions,omitempty"`
-	// ScaleCheck overrides the shell command whose output determines desired session count.
+	// ScaleCheck overrides the shell command whose output reports new
+	// unassigned session demand for bead-backed reconciliation.
 	ScaleCheck *string `toml:"scale_check,omitempty"`
 	// OptionDefaults adds or overrides provider option defaults for this agent.
 	// Keys are option keys, values are choice values. Merges additively
@@ -698,6 +768,13 @@ func (r *Rig) EffectivePrefix() string {
 	return DeriveBeadsPrefix(r.Name)
 }
 
+// EffectiveDefaultBranch returns the rig's recorded default branch, or the
+// empty string if none is set. Callers should fall back to a runtime probe
+// (e.g., git symbolic-ref) when this returns "".
+func (r *Rig) EffectiveDefaultBranch() string {
+	return strings.TrimSpace(r.DefaultBranch)
+}
+
 // EffectiveHQPrefix returns the bead ID prefix for the city's HQ store.
 // Uses the effective site-bound prefix first, then the declared workspace
 // Prefix, then derives one from the effective city name.
@@ -805,7 +882,7 @@ type Workspace struct {
 	// InstallAgentHooks lists provider names whose hooks should be installed
 	// into agent working directories. Agent-level overrides workspace-level
 	// (replace, not additive). Supported: "claude", "codex", "gemini",
-	// "opencode", "copilot", "cursor", "pi", "omp".
+	// "kiro", "opencode", "copilot", "cursor", "pi", "omp".
 	InstallAgentHooks []string `toml:"install_agent_hooks,omitempty"`
 	// GlobalFragments lists named template fragments injected into every
 	// agent's rendered prompt. Applied before per-agent InjectFragments.
@@ -1047,6 +1124,11 @@ type DoltConfig struct {
 	Port int `toml:"port,omitempty" jsonschema:"default=0"`
 	// Host is the dolt server hostname. Defaults to localhost.
 	Host string `toml:"host,omitempty" jsonschema:"default=localhost"`
+	// ArchiveLevel controls Dolt's auto_gc archive aggressiveness.
+	// 0 disables archive compaction (lower CPU on startup).
+	// 1 enables archive compaction (higher CPU on startup).
+	// nil (omitted) defaults to 0.
+	ArchiveLevel *int `toml:"archive_level,omitempty" jsonschema:"default=0"`
 }
 
 // FormulasConfig holds formula directory settings.
@@ -1180,6 +1262,95 @@ func (c ChatSessionsConfig) IdleTimeoutDuration() time.Duration {
 	return d
 }
 
+// DoctorConfig holds settings for the gc doctor surface. Operator-tunable
+// thresholds and policy toggles live here; mechanical structural checks
+// (broken-worktree pointers, missing files) remain hardcoded since they
+// cannot be operator-tuned in any meaningful sense.
+type DoctorConfig struct {
+	// WorktreeRigWarnSize is the per-rig warning threshold for the total
+	// disk footprint under .gc/worktrees/<rig>/. Reported by the
+	// worktree-disk-size check. Go-style human size string ("10GB", "500MB").
+	// Empty or unparseable falls back to the default (10 GB).
+	WorktreeRigWarnSize string `toml:"worktree_rig_warn_size,omitempty" jsonschema:"default=10GB"`
+
+	// WorktreeRigErrorSize is the per-rig error threshold. When any rig
+	// exceeds this, the worktree-disk-size check reports an error rather
+	// than a warning. Empty or unparseable falls back to the default
+	// (50 GB).
+	WorktreeRigErrorSize string `toml:"worktree_rig_error_size,omitempty" jsonschema:"default=50GB"`
+
+	// NestedWorktreePrune escalates the nested-worktree-prune check
+	// from warning to error severity when safely-prunable nested
+	// worktrees are present, so CI / scripted doctor runs fail until
+	// the operator runs `gc doctor --fix`. Actual removal still
+	// requires --fix; this flag does not auto-prune. Safety is
+	// enforced by mechanical checks (no uncommitted changes, no
+	// unpushed commits, no stashes) — never by role identity.
+	NestedWorktreePrune bool `toml:"nested_worktree_prune,omitempty" jsonschema:"default=false"`
+}
+
+const (
+	defaultWorktreeRigWarnBytes  = int64(10) * 1024 * 1024 * 1024 // 10 GB
+	defaultWorktreeRigErrorBytes = int64(50) * 1024 * 1024 * 1024 // 50 GB
+)
+
+// WorktreeRigWarnBytes returns the warning threshold in bytes. Falls
+// back to defaultWorktreeRigWarnBytes when unset, unparseable, or
+// non-positive.
+func (c DoctorConfig) WorktreeRigWarnBytes() int64 {
+	if n, ok := parseHumanSize(c.WorktreeRigWarnSize); ok && n > 0 {
+		return n
+	}
+	return defaultWorktreeRigWarnBytes
+}
+
+// WorktreeRigErrorBytes returns the error threshold in bytes. Falls
+// back to defaultWorktreeRigErrorBytes when unset, unparseable, or
+// non-positive. The error threshold is clamped to at least the warn
+// threshold to keep the two-tier semantics monotonic; if the operator
+// configures error < warn, the warn value wins.
+func (c DoctorConfig) WorktreeRigErrorBytes() int64 {
+	warn := c.WorktreeRigWarnBytes()
+	n, ok := parseHumanSize(c.WorktreeRigErrorSize)
+	if !ok || n <= 0 {
+		n = defaultWorktreeRigErrorBytes
+	}
+	if n < warn {
+		return warn
+	}
+	return n
+}
+
+// parseHumanSize parses sizes like "10GB", "500 MB", "1024" (bytes
+// implied) into a byte count. Whitespace tolerant, case-insensitive.
+// Returns ok=false when the string is empty or unparseable so callers
+// can apply their own default.
+func parseHumanSize(s string) (int64, bool) {
+	s = strings.TrimSpace(strings.ToUpper(s))
+	if s == "" {
+		return 0, false
+	}
+	var unit int64 = 1
+	switch {
+	case strings.HasSuffix(s, "GB"):
+		unit = 1024 * 1024 * 1024
+		s = strings.TrimSpace(strings.TrimSuffix(s, "GB"))
+	case strings.HasSuffix(s, "MB"):
+		unit = 1024 * 1024
+		s = strings.TrimSpace(strings.TrimSuffix(s, "MB"))
+	case strings.HasSuffix(s, "KB"):
+		unit = 1024
+		s = strings.TrimSpace(strings.TrimSuffix(s, "KB"))
+	case strings.HasSuffix(s, "B"):
+		s = strings.TrimSpace(strings.TrimSuffix(s, "B"))
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return n * unit, true
+}
+
 // ConvergenceConfig holds convergence loop limits.
 type ConvergenceConfig struct {
 	// MaxPerAgent is the maximum number of active convergence loops per agent.
@@ -1226,6 +1397,20 @@ type DaemonConfig struct {
 	// RestartWindow is the sliding time window for counting restarts.
 	// Duration string (e.g., "30s", "5m", "1h"). Defaults to "1h".
 	RestartWindow string `toml:"restart_window,omitempty" jsonschema:"default=1h"`
+	// SessionCircuitBreaker enables the named-session respawn circuit breaker.
+	// When enabled, the controller suppresses no-progress named-session respawns
+	// after the configured restart threshold is exceeded.
+	SessionCircuitBreaker bool `toml:"session_circuit_breaker,omitempty"`
+	// SessionCircuitBreakerMaxRestarts overrides MaxRestarts for the
+	// named-session respawn circuit breaker. Nil reuses MaxRestartsOrDefault.
+	// 0 disables the circuit breaker even when SessionCircuitBreaker is true.
+	SessionCircuitBreakerMaxRestarts *int `toml:"session_circuit_breaker_max_restarts,omitempty" jsonschema:"default=5"`
+	// SessionCircuitBreakerWindow overrides RestartWindow for the named-session
+	// respawn circuit breaker. Empty reuses RestartWindowDuration.
+	SessionCircuitBreakerWindow string `toml:"session_circuit_breaker_window,omitempty" jsonschema:"default=1h"`
+	// SessionCircuitBreakerResetAfter is the cooldown before an open named-session
+	// breaker resets automatically. Empty defaults to 2 * SessionCircuitBreakerWindowDuration.
+	SessionCircuitBreakerResetAfter string `toml:"session_circuit_breaker_reset_after,omitempty"`
 	// ShutdownTimeout is the time to wait after sending Ctrl-C before force-killing
 	// agents during shutdown. Duration string (e.g., "5s", "30s"). Set to "0s"
 	// for immediate kill. Defaults to "5s".
@@ -1256,6 +1441,13 @@ type DaemonConfig struct {
 	// single tick. Nil (unset) defaults to 5. Values <= 0 are treated as the
 	// default — set a positive integer to override.
 	MaxWakesPerTick *int `toml:"max_wakes_per_tick,omitempty" jsonschema:"default=5"`
+	// NudgeDispatcher selects how queued nudges get delivered to running
+	// sessions. "legacy" (default) auto-spawns a per-session `gc nudge poll`
+	// process that polls the file-backed queue every 2s. "supervisor" runs
+	// the delivery loop inside the city runtime instead, with a unix-socket
+	// wake fast path triggered by enqueue, eliminating the per-session bd
+	// shellout storm.
+	NudgeDispatcher string `toml:"nudge_dispatcher,omitempty" jsonschema:"default=legacy,enum=legacy,enum=supervisor"`
 }
 
 // PatrolIntervalDuration returns the patrol interval as a time.Duration.
@@ -1291,6 +1483,54 @@ func (d *DaemonConfig) RestartWindowDuration() time.Duration {
 		return time.Hour
 	}
 	return dur
+}
+
+// SessionCircuitBreakerMaxRestartsOrDefault returns the named-session respawn
+// circuit-breaker threshold. Nil reuses MaxRestartsOrDefault; zero disables it.
+func (d *DaemonConfig) SessionCircuitBreakerMaxRestartsOrDefault() int {
+	if d.SessionCircuitBreakerMaxRestarts == nil {
+		return d.MaxRestartsOrDefault()
+	}
+	return *d.SessionCircuitBreakerMaxRestarts
+}
+
+// SessionCircuitBreakerWindowDuration returns the named-session respawn
+// circuit-breaker rolling window. Empty reuses RestartWindowDuration.
+func (d *DaemonConfig) SessionCircuitBreakerWindowDuration() time.Duration {
+	if d.SessionCircuitBreakerWindow == "" {
+		return d.RestartWindowDuration()
+	}
+	dur, err := time.ParseDuration(d.SessionCircuitBreakerWindow)
+	if err != nil {
+		return d.RestartWindowDuration()
+	}
+	return dur
+}
+
+// SessionCircuitBreakerResetAfterDuration returns the named-session respawn
+// circuit-breaker cooldown. Empty or invalid values default to 2 * window.
+func (d *DaemonConfig) SessionCircuitBreakerResetAfterDuration() time.Duration {
+	window := d.SessionCircuitBreakerWindowDuration()
+	if d.SessionCircuitBreakerResetAfter == "" {
+		return 2 * window
+	}
+	dur, err := time.ParseDuration(d.SessionCircuitBreakerResetAfter)
+	if err != nil {
+		return 2 * window
+	}
+	return dur
+}
+
+// NudgeDispatcherMode returns the nudge dispatcher mode, defaulting to
+// "legacy". Unknown values are treated as "legacy" so a malformed config
+// does not silently disable the per-session pollers.
+func (d *DaemonConfig) NudgeDispatcherMode() string {
+	switch d.NudgeDispatcher {
+	case "supervisor":
+		return "supervisor"
+	default:
+		return "legacy"
+	}
 }
 
 // ShutdownTimeoutDuration returns the shutdown timeout as a time.Duration.
@@ -1539,12 +1779,15 @@ type Agent struct {
 	// MinActiveSessions is the minimum number of sessions to keep alive.
 	// Agent-level only. Counts against rig/workspace caps. Replaces pool.min.
 	MinActiveSessions *int `toml:"min_active_sessions,omitempty"`
-	// ScaleCheck is a shell command template whose output determines desired
-	// session count. Optional override — when set, its output is the desired
-	// count (still clamped by all cap levels). If it contains Go template
-	// placeholders, gc expands them using the same PathContext fields as
-	// work_dir and session_setup (Agent, AgentBase, Rig, RigRoot, CityRoot,
-	// CityName) before running the command.
+	// ScaleCheck is a shell command template whose output reports new
+	// unassigned session demand. In bead-backed reconciliation this is
+	// additive: assigned work is resumed separately, and ScaleCheck reports
+	// only how many new generic sessions to start, still bounded by all cap
+	// levels. Legacy no-store evaluation continues to treat the output as
+	// the desired session count. If it contains Go template placeholders, gc
+	// expands them using the same PathContext fields as work_dir and
+	// session_setup (Agent, AgentBase, Rig, RigRoot, CityRoot, CityName)
+	// before running the command.
 	ScaleCheck string `toml:"scale_check,omitempty"`
 	// DrainTimeout is the maximum time to wait for a session to finish its
 	// current work before force-killing it during scale-down. Duration string
@@ -1732,6 +1975,75 @@ type Agent struct {
 	// Set during V2 import expansion.
 	// Runtime-only — not persisted to TOML or JSON.
 	PackName string `toml:"-" json:"-"`
+	// source records which configuration origin this agent came from
+	// (inline city.toml, an explicit pack import, or an auto-imported
+	// system pack). Stamped once at discovery; consumed by
+	// describeSource to render duplicate-name errors that never carry
+	// an empty quoted path. Unexported so the value is package-private
+	// runtime state and never appears on any wire. (See ga-tpfc.)
+	source agentSource
+	// layout records which pack layout (v1 inline [[agent]] block in
+	// pack.toml vs. v2 agents/<name>/agent.toml convention) produced
+	// this agent. Stamped once at discovery; consumed by
+	// formatDuplicateAgentError to specialize the (V1Inline,
+	// V2Convention) collision into a migration-guidance variant.
+	// Unexported, runtime-only, never on any wire. (See ga-9ogb.)
+	layout agentLayout
+}
+
+// agentSource enumerates the configuration origins recognized by
+// describeSource. Discovery sites stamp exactly one value per agent.
+type agentSource uint8
+
+const (
+	// sourceUnknown is the zero value; agents reach validation
+	// without a stamp when they came through a non-discovery code
+	// path (e.g., test fixtures that build Agents directly).
+	sourceUnknown agentSource = iota
+	// sourceInline marks agents declared as inline [[agent]] tables
+	// in the root city.toml.
+	sourceInline
+	// sourcePack marks agents that came from an explicit pack
+	// import or a workspace.includes entry.
+	sourcePack
+	// sourceAutoImport marks agents that came from a binding the
+	// city pack added via [defaults.rig.imports] (e.g., the
+	// gastown system pack). Even though the binding ends up in
+	// city.Imports after composition, the user did not write it.
+	sourceAutoImport
+)
+
+// agentLayout enumerates the pack-layout origin of an agent: which
+// on-disk shape produced it. Exactly one value is stamped at
+// discovery time. Used by formatDuplicateAgentError to detect a v1↔v2
+// migration collision and emit a migration-guidance error. Unexported
+// so the type is package-private runtime state and never appears on
+// any wire.
+type agentLayout uint8
+
+const (
+	// layoutUnknown is the zero value. Agents reach validation
+	// without a layout stamp when they came through a non-discovery
+	// path (test fixtures, city.toml inline [[agent]] blocks — those
+	// last are a third category, not v1).
+	layoutUnknown agentLayout = iota
+	// layoutV1Inline marks agents declared as inline [[agent]] blocks
+	// in a pack's pack.toml.
+	layoutV1Inline
+	// layoutV2Convention marks agents discovered from a pack's
+	// agents/<name>/agent.toml file.
+	layoutV2Convention
+)
+
+// String renders an agentLayout for debug logs only.
+func (l agentLayout) String() string {
+	switch l {
+	case layoutV1Inline:
+		return "v1-inline"
+	case layoutV2Convention:
+		return "v2-convention"
+	}
+	return "unknown"
 }
 
 // IdleTimeoutDuration returns the idle timeout as a time.Duration.
@@ -1771,6 +2083,8 @@ func (a *Agent) AttachEnabled() bool {
 //
 // State priority: in_progress+assigned (crash recovery) >
 // ready+assigned (pre-assigned) > ready+unassigned+routed_to (pool).
+// Formula roots that are themselves executable must be represented as ready()
+// work (for example type=wisp); molecule containers are not routable demand.
 //
 // When the reconciler runs the query for demand detection (no session
 // context), all identity vars are empty → assignee tiers skip → only
@@ -1807,10 +2121,7 @@ func (a *Agent) EffectiveWorkQuery() string {
 			`r=$(bd ready --metadata-field gc.routed_to=` + target +
 			` --unassigned --json --limit=1 2>/dev/null); ` +
 			`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
-			// Tier 4: open routed molecule roots. scale_check already counts
-			// these, so startup must be able to see them too.
-			`bd list --metadata-field gc.routed_to=` + target +
-			` --status=open --type=molecule --no-assignee --json --limit=1 2>/dev/null'`
+			`printf "[]"'`
 	}
 	return `sh -c '` +
 		// Tier 1: in_progress assigned to any of my identifiers (crash recovery).
@@ -1909,22 +2220,16 @@ func (a *Agent) DrainTimeoutDuration() time.Duration {
 
 // EffectiveScaleCheck returns the scale check command for this agent.
 // If ScaleCheck is set, returns it. Otherwise returns a default that
-// counts actionable work routed to this agent's template, including
-// standalone formula-dispatched molecule beads (which bd ready excludes).
-// Attached formulas contribute demand through the routed source bead in the
-// ready/in_progress tiers instead of through the molecule count.
+// counts new unassigned work routed to this agent's template via ready().
+// Assigned in-progress work is resumed from session beads, so it must not
+// create additional generic pool demand here.
 func (a *Agent) EffectiveScaleCheck() string {
 	if a.ScaleCheck != "" {
 		return a.ScaleCheck
 	}
 	template := a.QualifiedName()
-	return `ready=$(bd ready --metadata-field gc.routed_to=` + template +
-		` --unassigned --json 2>/dev/null | jq 'length' 2>/dev/null); ` +
-		`active=$(bd list --metadata-field gc.routed_to=` + template +
-		` --status=in_progress --no-assignee --json 2>/dev/null | jq 'length' 2>/dev/null); ` +
-		`molecules=$(bd list --metadata-field gc.routed_to=` + template +
-		` --status=open --type=molecule --no-assignee --json 2>/dev/null | jq 'length' 2>/dev/null); ` +
-		`echo "$(( ${ready:-0} + ${active:-0} + ${molecules:-0} ))" || echo 0`
+	return `ready_json=$(bd ready --metadata-field gc.routed_to=` + template +
+		` --unassigned --limit 0 --json) && printf '%s\n' "$ready_json" | jq 'length'`
 }
 
 // EffectiveMaxActiveSessions returns the agent's max active sessions.
@@ -2022,10 +2327,26 @@ func (a *Agent) EffectiveOnDeath() string {
 	if a.OnDeath != "" {
 		return a.OnDeath
 	}
+	route := a.QualifiedName()
+	if a.PoolName != "" {
+		route = a.PoolName
+	}
+	// Reset both assignee and status: clearing assignee alone leaves the bead
+	// invisible to every work_query tier (Tier 1 needs assignee match, Tiers
+	// 2/3 only match "ready" status). The next worker re-claims via Tier 3
+	// (gc.routed_to + --unassigned). If routed metadata is missing entirely,
+	// backfill the fallback route so reopened direct-assigned work does not
+	// stay invisible.
 	return `bd list --assignee=` + a.QualifiedName() +
 		` --status=in_progress --json 2>/dev/null | ` +
-		`jq -r '.[].id' 2>/dev/null | ` +
-		`xargs -rI{} bd update {} --assignee "" 2>/dev/null`
+		`jq -r '.[] | [.id, (.metadata["gc.routed_to"] // "")] | @tsv' 2>/dev/null | ` +
+		`while IFS="$(printf '\t')" read -r id current_route; do ` +
+		`[ -z "$id" ] && continue; ` +
+		`if [ -n "$current_route" ]; then ` +
+		`bd update "$id" --assignee "" --status open 2>/dev/null; ` +
+		`else bd update "$id" --assignee "" --status open --set-metadata gc.routed_to=` + route + ` 2>/dev/null; ` +
+		`fi; ` +
+		`done`
 }
 
 // EffectiveOnBoot returns the on_boot command for this agent.
@@ -2040,9 +2361,9 @@ func (a *Agent) EffectiveOnBoot() string {
 		template = a.PoolName
 	}
 	return `bd list --metadata-field gc.routed_to=` + template +
-		` --status=in_progress --json 2>/dev/null | ` +
+		` --status=in_progress --no-assignee --json 2>/dev/null | ` +
 		`jq -r '.[].id' 2>/dev/null | ` +
-		`xargs -rI{} bd update {} --assignee "" 2>/dev/null`
+		`xargs -rI{} bd update {} --status open 2>/dev/null`
 }
 
 // InjectImplicitAgents adds on-demand agents for each configured provider at
@@ -2357,8 +2678,7 @@ func configuredProviderOrder(providers map[string]ProviderSpec) []string {
 // invalid pool bounds. Uniqueness is keyed on (dir, name) — the same name
 // in different dirs is allowed.
 func ValidateAgents(agents []Agent) error {
-	seen := make(map[agentKey]bool, len(agents))
-	sourceOf := make(map[agentKey]string, len(agents))
+	seen := make(map[agentKey]int, len(agents))
 	for i, a := range agents {
 		if a.Name == "" {
 			return fmt.Errorf("agent[%d]: name is required", i)
@@ -2367,17 +2687,10 @@ func ValidateAgents(agents []Agent) error {
 			return fmt.Errorf("agent %q: name must match [a-zA-Z0-9][a-zA-Z0-9_-]* (no spaces, slashes, or dots)", a.Name)
 		}
 		key := agentKey{dir: a.Dir, name: a.Name}
-		if seen[key] {
-			prev := sourceOf[key]
-			curr := a.SourceDir
-			if prev != "" || curr != "" {
-				return fmt.Errorf("agent %q: duplicate name (from %q and %q)",
-					a.QualifiedName(), prev, curr)
-			}
-			return fmt.Errorf("agent %q: duplicate name", a.QualifiedName())
+		if priorIdx, dup := seen[key]; dup {
+			return formatDuplicateAgentError(agents[priorIdx], a)
 		}
-		seen[key] = true
-		sourceOf[key] = a.SourceDir
+		seen[key] = i
 		// Scope enum.
 		switch a.Scope {
 		case "", "city", "rig":
@@ -2600,6 +2913,11 @@ func ValidateRigs(rigs []Rig, hqPrefix string) error {
 		if r.Name == "" {
 			return fmt.Errorf("rig[%d]: name is required", i)
 		}
+		// orders.RigWildcard is reserved as the [[orders.overrides]]
+		// token; a real rig with that name would be silently shadowed.
+		if r.Name == orders.RigWildcard {
+			return fmt.Errorf("rig[%d]: name %q is reserved as the [[orders.overrides]] wildcard", i, r.Name)
+		}
 		if r.Path == "" {
 			return fmt.Errorf("rig %q: path is required", r.Name)
 		}
@@ -2629,8 +2947,8 @@ func DefaultCity(name string) City {
 
 func defaultInstallAgentHooksForProvider(provider string) []string {
 	switch strings.TrimSpace(provider) {
-	case "opencode":
-		return []string{"opencode"}
+	case "kiro", "opencode":
+		return []string{strings.TrimSpace(provider)}
 	default:
 		return nil
 	}
@@ -2754,6 +3072,14 @@ func Parse(data []byte) (*City, error) {
 	// Backwards compat: promote deprecated graph_workflows → formula_v2.
 	if cfg.Daemon.GraphWorkflows && !cfg.Daemon.FormulaV2 {
 		cfg.Daemon.FormulaV2 = true
+	}
+	// Stamp source=sourceInline on agents declared via [[agent]] in
+	// the parsed TOML. These are city.toml inline agents (or test
+	// fixtures using Parse directly); pack agents go through a
+	// different parser (parsePackConfigWithMetadata) which does not
+	// stamp source.
+	for i := range cfg.Agents {
+		cfg.Agents[i].source = sourceInline
 	}
 	return &cfg, nil
 }

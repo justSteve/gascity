@@ -299,7 +299,8 @@ type CopyEntry struct {
 
 // HashPathContent returns a hex-encoded SHA-256 of the content at path.
 // For a regular file, hashes the file content. For a directory, hashes
-// a sorted manifest of relative paths and their contents. Returns empty
+// a sorted manifest of relative paths and their contents while ignoring
+// runtime-generated Python cache and editor backup artifacts. Returns empty
 // string on any error (caller should treat as "unknown").
 func HashPathContent(path string) string {
 	info, err := os.Stat(path)
@@ -325,10 +326,19 @@ func HashPathContent(path string) string {
 			walkErr = true
 			return nil
 		}
+		rel, _ := filepath.Rel(path, p)
+		if rel == "." {
+			return nil
+		}
+		if hashPathContentSkipEntry(d) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
 		if d.IsDir() {
 			return nil
 		}
-		rel, _ := filepath.Rel(path, p)
 		entries = append(entries, rel)
 		return nil
 	})
@@ -347,6 +357,25 @@ func HashPathContent(path string) string {
 		h.Write([]byte{0}) //nolint:errcheck // hash.Write never errors
 	}
 	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
+func hashPathContentSkipEntry(d fs.DirEntry) bool {
+	base := d.Name()
+	if d.IsDir() {
+		switch base {
+		case "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache":
+			return true
+		default:
+			return false
+		}
+	}
+	switch filepath.Ext(base) {
+	case ".pyc", ".pyo":
+		return true
+	case ".swp", ".swx":
+		return strings.HasPrefix(base, ".")
+	}
+	return strings.HasSuffix(base, "~")
 }
 
 // Config holds the parameters for starting a new session.
@@ -402,14 +431,16 @@ type Config struct {
 	SessionLive []string
 
 	// ProviderName is the resolved provider name (e.g., "claude", "codex").
-	// Used for per-provider overlay filtering: files from
-	// overlay/per-provider/<ProviderName>/ are copied alongside any extras
-	// listed in InstallAgentHooks.
+	// Used for launch/runtime behavior that follows a built-in family.
 	ProviderName string
+
+	// ProviderOverlayName is the concrete provider name used for per-provider
+	// overlay filtering. When empty, ProviderName is used for compatibility.
+	ProviderOverlayName string
 
 	// InstallAgentHooks lists additional provider hook slots whose
 	// overlay/per-provider/<name>/ content should be staged alongside
-	// ProviderName's. Populated from the agent's install_agent_hooks
+	// ProviderOverlayName's. Populated from the agent's install_agent_hooks
 	// config, so an agent running Claude can still get a materialized
 	// .gemini/settings.json for parallel tooling.
 	InstallAgentHooks []string
@@ -449,6 +480,40 @@ type Config struct {
 	// separately so the tmux adapter's file-expansion path can
 	// reconstruct the command correctly for long prompts.
 	PromptFlag string
+}
+
+// OverlayProviderNames returns the effective provider overlay slots to stage for
+// cfg, preserving first-use order while skipping empty and duplicate names.
+func OverlayProviderNames(cfg Config) []string {
+	return OverlayProviderNamesFromParts(cfg.ProviderName, cfg.ProviderOverlayName, cfg.InstallAgentHooks)
+}
+
+// OverlayProviderNamesFromParts returns the effective provider overlay slots
+// for a launch provider, concrete overlay provider, and installed hooks.
+func OverlayProviderNamesFromParts(providerName, providerOverlayName string, installAgentHooks []string) []string {
+	primary := strings.TrimSpace(providerOverlayName)
+	if primary == "" {
+		primary = strings.TrimSpace(providerName)
+	}
+	providers := make([]string, 0, 1+len(installAgentHooks))
+	providers = appendOverlayProviderName(providers, primary)
+	for _, hook := range installAgentHooks {
+		providers = appendOverlayProviderName(providers, hook)
+	}
+	return providers
+}
+
+func appendOverlayProviderName(providers []string, name string) []string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return providers
+	}
+	for _, existing := range providers {
+		if existing == name {
+			return providers
+		}
+	}
+	return append(providers, name)
 }
 
 // SyncWorkDirEnv returns cfg with GC_DIR synchronized to WorkDir.

@@ -169,7 +169,7 @@
         },
         "scale_check": {
           "type": "string",
-          "description": "ScaleCheck is a shell command template whose output determines desired\nsession count. Optional override — when set, its output is the desired\ncount (still clamped by all cap levels). If it contains Go template\nplaceholders, gc expands them using the same PathContext fields as\nwork_dir and session_setup (Agent, AgentBase, Rig, RigRoot, CityRoot,\nCityName) before running the command."
+          "description": "ScaleCheck is a shell command template whose output reports new\nunassigned session demand. In bead-backed reconciliation this is\nadditive: assigned work is resumed separately, and ScaleCheck reports\nonly how many new generic sessions to start, still bounded by all cap\nlevels. Legacy no-store evaluation continues to treat the output as\nthe desired session count. If it contains Go template placeholders, gc\nexpands them using the same PathContext fields as work_dir and\nsession_setup (Agent, AgentBase, Rig, RigRoot, CityRoot, CityName)\nbefore running the command."
         },
         "drain_timeout": {
           "type": "string",
@@ -501,7 +501,7 @@
             "type": "string"
           },
           "type": "array",
-          "description": "InjectFragments overrides the agent's inject_fragments list."
+          "description": "InjectFragments overrides the agent's inject_fragments list. Leave this\nfield unset to keep inherited fragments; JSON callers may send null for\nthe same no-op. Set an empty list to clear fragments; set a populated\nlist to replace fragments."
         },
         "append_fragments": {
           "items": {
@@ -592,7 +592,7 @@
         },
         "scale_check": {
           "type": "string",
-          "description": "ScaleCheck overrides the shell command whose output determines desired session count."
+          "description": "ScaleCheck overrides the shell command whose output reports new\nunassigned session demand for bead-backed reconciliation."
         },
         "option_defaults": {
           "additionalProperties": {
@@ -662,7 +662,7 @@
         },
         "session": {
           "type": "string",
-          "description": "Session overrides the session transport (\"acp\")."
+          "description": "Session overrides the session transport (\"acp\" or \"tmux\")."
         },
         "provider": {
           "type": "string",
@@ -758,7 +758,7 @@
             "type": "string"
           },
           "type": "array",
-          "description": "InjectFragments overrides the agent's inject_fragments list."
+          "description": "InjectFragments overrides the agent's inject_fragments list. Leave this\nfield unset to keep inherited fragments; JSON callers may send null for\nthe same no-op. Set an empty list to clear fragments; set a populated\nlist to replace fragments."
         },
         "append_fragments": {
           "items": {
@@ -835,7 +835,7 @@
         },
         "scale_check": {
           "type": "string",
-          "description": "ScaleCheck overrides the command template whose output determines desired\nsession count. Supports the same Go template placeholders as\nAgent.scale_check."
+          "description": "ScaleCheck overrides the command template whose output reports new\nunassigned session demand for bead-backed reconciliation. Supports the\nsame Go template placeholders as Agent.scale_check."
         },
         "option_defaults": {
           "additionalProperties": {
@@ -983,6 +983,10 @@
           "$ref": "#/$defs/ConvergenceConfig",
           "description": "Convergence configures convergence loop limits."
         },
+        "doctor": {
+          "$ref": "#/$defs/DoctorConfig",
+          "description": "Doctor configures gc doctor thresholds and policy toggles\n(worktree size warnings, nested-worktree auto-prune)."
+        },
         "service": {
           "items": {
             "$ref": "#/$defs/Service"
@@ -993,6 +997,13 @@
         "agent_defaults": {
           "$ref": "#/$defs/AgentDefaults",
           "description": "AgentDefaults provides city-level defaults for agents that don't\noverride them (canonical TOML key: agent_defaults). The runtime\ncurrently applies default_sling_formula and append_fragments; the\nattachment-list fields remain tombstones, and the other fields are\nparsed/composed but not yet inherited automatically."
+        },
+        "pricing": {
+          "items": {
+            "$ref": "#/$defs/ModelPricing"
+          },
+          "type": "array",
+          "description": "Pricing holds per-model cost rate overrides keyed by (provider, model).\nCity-level entries override pack-level entries which override the\ndefaults shipped with the pricing package. See internal/pricing for the\nestimation seam introduced by issue #1255 (1d)."
         }
       },
       "additionalProperties": false,
@@ -1045,6 +1056,24 @@
           "description": "RestartWindow is the sliding time window for counting restarts.\nDuration string (e.g., \"30s\", \"5m\", \"1h\"). Defaults to \"1h\".",
           "default": "1h"
         },
+        "session_circuit_breaker": {
+          "type": "boolean",
+          "description": "SessionCircuitBreaker enables the named-session respawn circuit breaker.\nWhen enabled, the controller suppresses no-progress named-session respawns\nafter the configured restart threshold is exceeded."
+        },
+        "session_circuit_breaker_max_restarts": {
+          "type": "integer",
+          "description": "SessionCircuitBreakerMaxRestarts overrides MaxRestarts for the\nnamed-session respawn circuit breaker. Nil reuses MaxRestartsOrDefault.\n0 disables the circuit breaker even when SessionCircuitBreaker is true.",
+          "default": 5
+        },
+        "session_circuit_breaker_window": {
+          "type": "string",
+          "description": "SessionCircuitBreakerWindow overrides RestartWindow for the named-session\nrespawn circuit breaker. Empty reuses RestartWindowDuration.",
+          "default": "1h"
+        },
+        "session_circuit_breaker_reset_after": {
+          "type": "string",
+          "description": "SessionCircuitBreakerResetAfter is the cooldown before an open named-session\nbreaker resets automatically. Empty defaults to 2 * SessionCircuitBreakerWindowDuration."
+        },
         "shutdown_timeout": {
           "type": "string",
           "description": "ShutdownTimeout is the time to wait after sending Ctrl-C before force-killing\nagents during shutdown. Duration string (e.g., \"5s\", \"30s\"). Set to \"0s\"\nfor immediate kill. Defaults to \"5s\".",
@@ -1079,11 +1108,42 @@
           "type": "integer",
           "description": "MaxWakesPerTick caps how many sessions the reconciler may start in a\nsingle tick. Nil (unset) defaults to 5. Values \u003c= 0 are treated as the\ndefault — set a positive integer to override.",
           "default": 5
+        },
+        "nudge_dispatcher": {
+          "type": "string",
+          "enum": [
+            "legacy",
+            "supervisor"
+          ],
+          "description": "NudgeDispatcher selects how queued nudges get delivered to running\nsessions. \"legacy\" (default) auto-spawns a per-session `gc nudge poll`\nprocess that polls the file-backed queue every 2s. \"supervisor\" runs\nthe delivery loop inside the city runtime instead, with a unix-socket\nwake fast path triggered by enqueue, eliminating the per-session bd\nshellout storm.",
+          "default": "legacy"
         }
       },
       "additionalProperties": false,
       "type": "object",
       "description": "DaemonConfig holds controller daemon settings."
+    },
+    "DoctorConfig": {
+      "properties": {
+        "worktree_rig_warn_size": {
+          "type": "string",
+          "description": "WorktreeRigWarnSize is the per-rig warning threshold for the total\ndisk footprint under .gc/worktrees/\u003crig\u003e/. Reported by the\nworktree-disk-size check. Go-style human size string (\"10GB\", \"500MB\").\nEmpty or unparseable falls back to the default (10 GB).",
+          "default": "10GB"
+        },
+        "worktree_rig_error_size": {
+          "type": "string",
+          "description": "WorktreeRigErrorSize is the per-rig error threshold. When any rig\nexceeds this, the worktree-disk-size check reports an error rather\nthan a warning. Empty or unparseable falls back to the default\n(50 GB).",
+          "default": "50GB"
+        },
+        "nested_worktree_prune": {
+          "type": "boolean",
+          "description": "NestedWorktreePrune escalates the nested-worktree-prune check\nfrom warning to error severity when safely-prunable nested\nworktrees are present, so CI / scripted doctor runs fail until\nthe operator runs `gc doctor --fix`. Actual removal still\nrequires --fix; this flag does not auto-prune. Safety is\nenforced by mechanical checks (no uncommitted changes, no\nunpushed commits, no stashes) — never by role identity.",
+          "default": false
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "description": "DoctorConfig holds settings for the gc doctor surface."
     },
     "DoltConfig": {
       "properties": {
@@ -1096,6 +1156,11 @@
           "type": "string",
           "description": "Host is the dolt server hostname. Defaults to localhost.",
           "default": "localhost"
+        },
+        "archive_level": {
+          "type": "integer",
+          "description": "ArchiveLevel controls Dolt's auto_gc archive aggressiveness.\n0 disables archive compaction (lower CPU on startup).\n1 enables archive compaction (higher CPU on startup).\nnil (omitted) defaults to 0.",
+          "default": 0
         }
       },
       "additionalProperties": false,
@@ -1214,6 +1279,35 @@
       "type": "object",
       "description": "MailConfig holds mail provider settings."
     },
+    "ModelPricing": {
+      "properties": {
+        "provider": {
+          "type": "string",
+          "description": "Provider is the LLM provider label (e.g. \"claude\", \"codex\", \"gemini\")."
+        },
+        "model": {
+          "type": "string",
+          "description": "Model is the provider-specific model identifier (e.g. \"claude-opus-4-7\")."
+        },
+        "tier": {
+          "$ref": "#/$defs/Tier",
+          "description": "Tier holds the per-token-type rates."
+        },
+        "last_verified": {
+          "type": "string",
+          "description": "LastVerified is the date these rates were confirmed (YYYY-MM-DD)."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "provider",
+        "model",
+        "tier",
+        "last_verified"
+      ],
+      "description": "ModelPricing is a complete pricing entry for a (Provider, Model) pair."
+    },
     "NamedSession": {
       "properties": {
         "name": {
@@ -1266,6 +1360,16 @@
           },
           "type": "array",
           "description": "FlagArgs are the CLI arguments injected when this choice is selected.\njson:\"-\" is intentional: FlagArgs must never appear in the public API DTO\n(security boundary — prevents clients from seeing internal CLI flags)."
+        },
+        "flag_aliases": {
+          "items": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "type": "array",
+          "description": "FlagAliases are equivalent CLI argument sequences stripped from legacy\nprovider args. Like FlagArgs, they stay server-side only."
         }
       },
       "additionalProperties": false,
@@ -1598,7 +1702,7 @@
             "type": "string"
           },
           "type": "array",
-          "description": "Args are default command-line arguments passed to the provider."
+          "description": "Args are default command-line arguments passed to the provider. The\nbuilt-in Kiro provider defaults to\n[\"chat\", \"--no-interactive\", \"--agent\", \"gascity\", \"--trust-all-tools\"];\nremove or replace \"--trust-all-tools\" by defining [providers.kiro].args\nexplicitly in city.toml."
         },
         "prompt_mode": {
           "type": "string",
@@ -1667,7 +1771,7 @@
         },
         "resume_command": {
           "type": "string",
-          "description": "ResumeCommand is the full shell command to run when resuming a session.\nSupports {{.SessionKey}} template variable. When set, takes precedence\nover ResumeFlag/ResumeStyle. Example:\n  \"claude --resume {{.SessionKey}} --dangerously-skip-permissions\""
+          "description": "ResumeCommand is the full shell command to run when resuming a session.\nSupports only the {{.SessionKey}} template variable. When set, takes precedence\nover ResumeFlag/ResumeStyle. When schema-managed defaults are inserted, the\nresolver tokenizes and re-emits the command; for subcommand-style resume it\ninserts after the ResumeFlag token that precedes {{.SessionKey}}. Example:\n  \"claude --resume {{.SessionKey}} --dangerously-skip-permissions\"\nSchema-managed defaults missing from a subcommand-style resume command\nare inserted before {{.SessionKey}} during provider resolution."
         },
         "session_id_flag": {
           "type": "string",
@@ -1678,7 +1782,7 @@
             "type": "string"
           },
           "type": "object",
-          "description": "PermissionModes maps permission mode names to CLI flags.\nExample: {\"unrestricted\": \"--dangerously-skip-permissions\", \"plan\": \"--permission-mode plan\"}\nThis is a config-only lookup table consumed by external clients\n(e.g., Mission Control) to populate permission mode dropdowns.\nLaunch-time flag substitution is planned for a follow-up PR —\ncurrently no runtime code reads this field."
+          "description": "PermissionModes maps permission mode names to CLI flags.\nExample: {\"unrestricted\": \"--dangerously-skip-permissions\", \"plan\": \"--permission-mode plan\"}\nThis is a config-only lookup table consumed by external clients\n(e.g., real-world app) to populate permission mode dropdowns.\nLaunch-time flag substitution is planned for a follow-up PR —\ncurrently no runtime code reads this field."
         },
         "option_defaults": {
           "additionalProperties": {
@@ -1734,6 +1838,10 @@
         "prefix": {
           "type": "string",
           "description": "Prefix overrides the auto-derived bead ID prefix for this rig."
+        },
+        "default_branch": {
+          "type": "string",
+          "description": "DefaultBranch is the rig repository's mainline branch (e.g. \"main\",\n\"master\", \"develop\"). When set, routing formulas use this as the\ndefault merge target instead of probing origin/HEAD at sling time.\nCaptured by `gc rig add` from the rig's git config; set manually for\nrigs whose mainline isn't reachable via origin/HEAD."
         },
         "suspended": {
           "type": "boolean",
@@ -1812,6 +1920,10 @@
         "prefix": {
           "type": "string",
           "description": "Prefix overrides the bead ID prefix."
+        },
+        "default_branch": {
+          "type": "string",
+          "description": "DefaultBranch overrides the rig's recorded mainline branch."
         },
         "suspended": {
           "type": "boolean",
@@ -2005,6 +2117,31 @@
       "type": "object",
       "description": "SessionSleepConfig configures default idle sleep policies by session class."
     },
+    "Tier": {
+      "properties": {
+        "prompt_usd_per_1m": {
+          "type": "number"
+        },
+        "completion_usd_per_1m": {
+          "type": "number"
+        },
+        "cache_read_usd_per_1m": {
+          "type": "number"
+        },
+        "cache_creation_usd_per_1m": {
+          "type": "number"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "prompt_usd_per_1m",
+        "completion_usd_per_1m",
+        "cache_read_usd_per_1m",
+        "cache_creation_usd_per_1m"
+      ],
+      "description": "Tier defines per-token-type rates in USD per 1 million tokens."
+    },
     "Workspace": {
       "properties": {
         "name": {
@@ -2040,7 +2177,7 @@
             "type": "string"
           },
           "type": "array",
-          "description": "InstallAgentHooks lists provider names whose hooks should be installed\ninto agent working directories. Agent-level overrides workspace-level\n(replace, not additive). Supported: \"claude\", \"codex\", \"gemini\",\n\"opencode\", \"copilot\", \"cursor\", \"pi\", \"omp\"."
+          "description": "InstallAgentHooks lists provider names whose hooks should be installed\ninto agent working directories. Agent-level overrides workspace-level\n(replace, not additive). Supported: \"claude\", \"codex\", \"gemini\",\n\"kiro\", \"opencode\", \"copilot\", \"cursor\", \"pi\", \"omp\"."
         },
         "global_fragments": {
           "items": {

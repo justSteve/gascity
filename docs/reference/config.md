@@ -31,8 +31,10 @@ City is the top-level configuration for a Gas City instance.
 | `chat_sessions` | ChatSessionsConfig |  |  | ChatSessions configures chat session behavior (auto-suspend). |
 | `session_sleep` | SessionSleepConfig |  |  | SessionSleep configures idle sleep policy defaults for managed sessions. |
 | `convergence` | ConvergenceConfig |  |  | Convergence configures convergence loop limits. |
+| `doctor` | DoctorConfig |  |  | Doctor configures gc doctor thresholds and policy toggles (worktree size warnings, nested-worktree auto-prune). |
 | `service` | []Service |  |  | Services declares workspace-owned HTTP services mounted on the controller edge under /svc/&#123;name&#125;. |
 | `agent_defaults` | AgentDefaults |  |  | AgentDefaults provides city-level defaults for agents that don't override them (canonical TOML key: agent_defaults). The runtime currently applies default_sling_formula and append_fragments; the attachment-list fields remain tombstones, and the other fields are parsed/composed but not yet inherited automatically. |
+| `pricing` | []ModelPricing |  |  | Pricing holds per-model cost rate overrides keyed by (provider, model). City-level entries override pack-level entries which override the defaults shipped with the pricing package. See internal/pricing for the estimation seam introduced by issue #1255 (1d). |
 
 ## ACPSessionConfig
 
@@ -83,7 +85,7 @@ Agent defines a configured agent in the city.
 | `option_defaults` | map[string]string |  |  | OptionDefaults overrides the provider's effective schema defaults for this agent. Keys are option keys, values are choice values. Applied on top of the provider's OptionDefaults (agent keys win). Example: option_defaults = &#123; permission_mode = "plan", model = "sonnet" &#125; |
 | `max_active_sessions` | integer |  |  | MaxActiveSessions is the agent-level cap on concurrent sessions. Nil means inherit from rig, then workspace, then unlimited. Replaces pool.max. |
 | `min_active_sessions` | integer |  |  | MinActiveSessions is the minimum number of sessions to keep alive. Agent-level only. Counts against rig/workspace caps. Replaces pool.min. |
-| `scale_check` | string |  |  | ScaleCheck is a shell command template whose output determines desired session count. Optional override — when set, its output is the desired count (still clamped by all cap levels). If it contains Go template placeholders, gc expands them using the same PathContext fields as work_dir and session_setup (Agent, AgentBase, Rig, RigRoot, CityRoot, CityName) before running the command. |
+| `scale_check` | string |  |  | ScaleCheck is a shell command template whose output reports new unassigned session demand. In bead-backed reconciliation this is additive: assigned work is resumed separately, and ScaleCheck reports only how many new generic sessions to start, still bounded by all cap levels. Legacy no-store evaluation continues to treat the output as the desired session count. If it contains Go template placeholders, gc expands them using the same PathContext fields as work_dir and session_setup (Agent, AgentBase, Rig, RigRoot, CityRoot, CityName) before running the command. |
 | `drain_timeout` | string |  | `5m` | DrainTimeout is the maximum time to wait for a session to finish its current work before force-killing it during scale-down. Duration string (e.g., "5m", "30m", "1h"). Defaults to "5m". |
 | `on_boot` | string |  |  | OnBoot is a shell command template run once at controller startup for this agent. If it contains Go template placeholders, gc expands them using the same PathContext fields as work_dir and session_setup (Agent, AgentBase, Rig, RigRoot, CityRoot, CityName) before running the command. |
 | `on_death` | string |  |  | OnDeath is a shell command template run when a session dies unexpectedly. If it contains Go template placeholders, gc expands them using the same PathContext fields as work_dir and session_setup (Agent, AgentBase, Rig, RigRoot, CityRoot, CityName) before running the command. |
@@ -157,7 +159,7 @@ AgentOverride modifies a pack-stamped agent for a specific rig.
 | `session_live` | []string |  |  | SessionLive overrides the agent's session_live commands. |
 | `overlay_dir` | string |  |  | OverlayDir overrides the agent's overlay_dir path. Copies contents additively into the agent's working directory at startup. Relative paths resolve against the city directory. |
 | `default_sling_formula` | string |  |  | DefaultSlingFormula overrides the default sling formula. |
-| `inject_fragments` | []string |  |  | InjectFragments overrides the agent's inject_fragments list. |
+| `inject_fragments` | []string |  |  | InjectFragments overrides the agent's inject_fragments list. Leave this field unset to keep inherited fragments; JSON callers may send null for the same no-op. Set an empty list to clear fragments; set a populated list to replace fragments. |
 | `append_fragments` | []string |  |  | AppendFragments appends named template fragments to this agent's rendered prompt. It is the V2 spelling for per-agent fragment selection. |
 | `pre_start_append` | []string |  |  | PreStartAppend appends commands to the agent's pre_start list (instead of replacing). Applied after PreStart if both are set. |
 | `session_setup_append` | []string |  |  | SessionSetupAppend appends commands to the agent's session_setup list. |
@@ -172,7 +174,7 @@ AgentOverride modifies a pack-stamped agent for a specific rig.
 | `inject_fragments_append` | []string |  |  | InjectFragmentsAppend appends to the agent's inject_fragments list. |
 | `max_active_sessions` | integer |  |  | MaxActiveSessions overrides the agent-level cap on concurrent sessions. |
 | `min_active_sessions` | integer |  |  | MinActiveSessions overrides the minimum number of sessions to keep alive. |
-| `scale_check` | string |  |  | ScaleCheck overrides the shell command whose output determines desired session count. |
+| `scale_check` | string |  |  | ScaleCheck overrides the shell command whose output reports new unassigned session demand for bead-backed reconciliation. |
 | `option_defaults` | map[string]string |  |  | OptionDefaults adds or overrides provider option defaults for this agent. Keys are option keys, values are choice values. Merges additively (override keys win over existing agent keys). Example: option_defaults = &#123; model = "sonnet" &#125; |
 
 ## AgentPatch
@@ -191,7 +193,7 @@ AgentPatch modifies an existing agent identified by (Dir, Name).
 | `env_remove` | []string |  |  | EnvRemove lists env var keys to remove after merging. |
 | `pre_start` | []string |  |  | PreStart overrides the agent's pre_start commands. |
 | `prompt_template` | string |  |  | PromptTemplate overrides the prompt template path. Relative paths resolve against the city directory. |
-| `session` | string |  |  | Session overrides the session transport ("acp"). |
+| `session` | string |  |  | Session overrides the session transport ("acp" or "tmux"). |
 | `provider` | string |  |  | Provider overrides the provider name. |
 | `start_command` | string |  |  | StartCommand overrides the start command. |
 | `nudge` | string |  |  | Nudge overrides the nudge text. |
@@ -209,7 +211,7 @@ AgentPatch modifies an existing agent identified by (Dir, Name).
 | `session_live` | []string |  |  | SessionLive overrides the agent's session_live commands. |
 | `overlay_dir` | string |  |  | OverlayDir overrides the agent's overlay_dir path. Copies contents additively into the agent's working directory at startup. Relative paths resolve against the city directory. |
 | `default_sling_formula` | string |  |  | DefaultSlingFormula overrides the default sling formula. |
-| `inject_fragments` | []string |  |  | InjectFragments overrides the agent's inject_fragments list. |
+| `inject_fragments` | []string |  |  | InjectFragments overrides the agent's inject_fragments list. Leave this field unset to keep inherited fragments; JSON callers may send null for the same no-op. Set an empty list to clear fragments; set a populated list to replace fragments. |
 | `append_fragments` | []string |  |  | AppendFragments overrides the agent's append_fragments list. |
 | `attach` | boolean |  |  | Attach overrides the agent's attach setting. |
 | `depends_on` | []string |  |  | DependsOn overrides the agent's dependency list. |
@@ -222,7 +224,7 @@ AgentPatch modifies an existing agent identified by (Dir, Name).
 | `inject_fragments_append` | []string |  |  | InjectFragmentsAppend appends to the agent's inject_fragments list. |
 | `max_active_sessions` | integer |  |  | MaxActiveSessions overrides the agent-level cap on concurrent sessions. |
 | `min_active_sessions` | integer |  |  | MinActiveSessions overrides the minimum number of sessions to keep alive. |
-| `scale_check` | string |  |  | ScaleCheck overrides the command template whose output determines desired session count. Supports the same Go template placeholders as Agent.scale_check. |
+| `scale_check` | string |  |  | ScaleCheck overrides the command template whose output reports new unassigned session demand for bead-backed reconciliation. Supports the same Go template placeholders as Agent.scale_check. |
 | `option_defaults` | map[string]string |  |  | OptionDefaults adds or overrides provider option defaults for this agent. Keys are option keys, values are choice values. Merges additively (patch keys win over existing agent keys). Example: option_defaults = &#123; model = "sonnet" &#125; |
 
 ## BeadsConfig
@@ -261,6 +263,10 @@ DaemonConfig holds controller daemon settings.
 | `patrol_interval` | string |  | `30s` | PatrolInterval is the health patrol interval. Duration string (e.g., "30s", "5m", "1h"). Defaults to "30s". |
 | `max_restarts` | integer |  | `5` | MaxRestarts is the maximum number of agent restarts within RestartWindow before the agent is quarantined. 0 means unlimited (no crash loop detection). Defaults to 5. |
 | `restart_window` | string |  | `1h` | RestartWindow is the sliding time window for counting restarts. Duration string (e.g., "30s", "5m", "1h"). Defaults to "1h". |
+| `session_circuit_breaker` | boolean |  |  | SessionCircuitBreaker enables the named-session respawn circuit breaker. When enabled, the controller suppresses no-progress named-session respawns after the configured restart threshold is exceeded. |
+| `session_circuit_breaker_max_restarts` | integer |  | `5` | SessionCircuitBreakerMaxRestarts overrides MaxRestarts for the named-session respawn circuit breaker. Nil reuses MaxRestartsOrDefault. 0 disables the circuit breaker even when SessionCircuitBreaker is true. |
+| `session_circuit_breaker_window` | string |  | `1h` | SessionCircuitBreakerWindow overrides RestartWindow for the named-session respawn circuit breaker. Empty reuses RestartWindowDuration. |
+| `session_circuit_breaker_reset_after` | string |  |  | SessionCircuitBreakerResetAfter is the cooldown before an open named-session breaker resets automatically. Empty defaults to 2 * SessionCircuitBreakerWindowDuration. |
 | `shutdown_timeout` | string |  | `5s` | ShutdownTimeout is the time to wait after sending Ctrl-C before force-killing agents during shutdown. Duration string (e.g., "5s", "30s"). Set to "0s" for immediate kill. Defaults to "5s". |
 | `wisp_gc_interval` | string |  |  | WispGCInterval is how often wisp GC runs. Duration string (e.g., "5m", "1h"). Wisp GC is disabled unless both WispGCInterval and WispTTL are set. |
 | `wisp_ttl` | string |  |  | WispTTL is how long a closed molecule survives before being purged. Duration string (e.g., "24h", "7d"). Wisp GC is disabled unless both WispGCInterval and WispTTL are set. |
@@ -268,6 +274,17 @@ DaemonConfig holds controller daemon settings.
 | `observe_paths` | []string |  |  | ObservePaths lists extra directories to search for Claude JSONL session files (e.g., aimux session paths). The default search path (~/.claude/projects/) is always included. |
 | `probe_concurrency` | integer |  | `8` | ProbeConcurrency bounds the number of concurrent bd subprocess probes issued by the pool scale_check and work_query paths. bd serializes on a shared dolt sql-server, so unbounded parallelism causes contention. Nil (unset) defaults to 8. Set higher for workspaces with a fast dedicated dolt server, or lower to reduce contention on slow storage. |
 | `max_wakes_per_tick` | integer |  | `5` | MaxWakesPerTick caps how many sessions the reconciler may start in a single tick. Nil (unset) defaults to 5. Values &lt;= 0 are treated as the default — set a positive integer to override. |
+| `nudge_dispatcher` | string |  | `legacy` | NudgeDispatcher selects how queued nudges get delivered to running sessions. "legacy" (default) auto-spawns a per-session `gc nudge poll` process that polls the file-backed queue every 2s. "supervisor" runs the delivery loop inside the city runtime instead, with a unix-socket wake fast path triggered by enqueue, eliminating the per-session bd shellout storm. Enum: `legacy`, `supervisor` |
+
+## DoctorConfig
+
+DoctorConfig holds settings for the gc doctor surface.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `worktree_rig_warn_size` | string |  | `10GB` | WorktreeRigWarnSize is the per-rig warning threshold for the total disk footprint under .gc/worktrees/&lt;rig&gt;/. Reported by the worktree-disk-size check. Go-style human size string ("10GB", "500MB"). Empty or unparseable falls back to the default (10 GB). |
+| `worktree_rig_error_size` | string |  | `50GB` | WorktreeRigErrorSize is the per-rig error threshold. When any rig exceeds this, the worktree-disk-size check reports an error rather than a warning. Empty or unparseable falls back to the default (50 GB). |
+| `nested_worktree_prune` | boolean |  | `false` | NestedWorktreePrune escalates the nested-worktree-prune check from warning to error severity when safely-prunable nested worktrees are present, so CI / scripted doctor runs fail until the operator runs `gc doctor --fix`. Actual removal still requires --fix; this flag does not auto-prune. Safety is enforced by mechanical checks (no uncommitted changes, no unpushed commits, no stashes) — never by role identity. |
 
 ## DoltConfig
 
@@ -277,6 +294,7 @@ DoltConfig holds optional dolt server overrides.
 |-------|------|----------|---------|-------------|
 | `port` | integer |  | `0` | Port is the dolt server port. 0 means use ephemeral port allocation (hashed from city path). Set explicitly to override. |
 | `host` | string |  | `localhost` | Host is the dolt server hostname. Defaults to localhost. |
+| `archive_level` | integer |  | `0` | ArchiveLevel controls Dolt's auto_gc archive aggressiveness. 0 disables archive compaction (lower CPU on startup). 1 enables archive compaction (higher CPU on startup). nil (omitted) defaults to 0. |
 
 ## EventsConfig
 
@@ -329,6 +347,17 @@ MailConfig holds mail provider settings.
 |-------|------|----------|---------|-------------|
 | `provider` | string |  |  | Provider selects the mail backend: "fake", "fail", "exec:&lt;script&gt;", or "" (default: beadmail). |
 
+## ModelPricing
+
+ModelPricing is a complete pricing entry for a (Provider, Model) pair.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `provider` | string | **yes** |  | Provider is the LLM provider label (e.g. "claude", "codex", "gemini"). |
+| `model` | string | **yes** |  | Model is the provider-specific model identifier (e.g. "claude-opus-4-7"). |
+| `tier` | Tier | **yes** |  | Tier holds the per-token-type rates. |
+| `last_verified` | string | **yes** |  | LastVerified is the date these rates were confirmed (YYYY-MM-DD). |
+
 ## NamedSession
 
 NamedSession defines a canonical persistent session backed by an agent template.
@@ -350,6 +379,7 @@ OptionChoice is one allowed value for a "select" option.
 | `value` | string | **yes** |  |  |
 | `label` | string | **yes** |  |  |
 | `flag_args` | []string | **yes** |  | FlagArgs are the CLI arguments injected when this choice is selected. json:"-" is intentional: FlagArgs must never appear in the public API DTO (security boundary — prevents clients from seeing internal CLI flags). |
+| `flag_aliases` | []array |  |  | FlagAliases are equivalent CLI argument sequences stripped from legacy provider args. Like FlagArgs, they stay server-side only. |
 
 ## OrderOverride
 
@@ -457,7 +487,7 @@ ProviderSpec defines a named provider's startup parameters.
 | `options_schema_merge` | string |  |  | OptionsSchemaMerge controls OptionsSchema merge mode across the chain: "replace" (default) or "by_key". Enum: `replace`, `by_key` |
 | `display_name` | string |  |  | DisplayName is the human-readable name shown in UI and logs. |
 | `command` | string |  |  | Command is the executable to run for this provider. |
-| `args` | []string |  |  | Args are default command-line arguments passed to the provider. |
+| `args` | []string |  |  | Args are default command-line arguments passed to the provider. The built-in Kiro provider defaults to ["chat", "--no-interactive", "--agent", "gascity", "--trust-all-tools"]; remove or replace "--trust-all-tools" by defining [providers.kiro].args explicitly in city.toml. |
 | `prompt_mode` | string |  | `arg` | PromptMode controls how prompts are delivered: "arg", "flag", or "none". Enum: `arg`, `flag`, `none` |
 | `prompt_flag` | string |  |  | PromptFlag is the CLI flag used when prompt_mode is "flag" (e.g. "--prompt"). |
 | `ready_delay_ms` | integer |  |  | ReadyDelayMs is milliseconds to wait after launch before the provider is considered ready. |
@@ -471,9 +501,9 @@ ProviderSpec defines a named provider's startup parameters.
 | `instructions_file` | string |  |  | InstructionsFile is the filename the provider reads for project instructions (e.g., "CLAUDE.md", "AGENTS.md"). Empty defaults to "AGENTS.md". |
 | `resume_flag` | string |  |  | ResumeFlag is the CLI flag for resuming a session by ID. Empty means the provider does not support resume. Examples: "--resume" (claude), "resume" (codex) |
 | `resume_style` | string |  |  | ResumeStyle controls how ResumeFlag is applied:   "flag"       → command --resume &lt;key&gt;              (default)   "subcommand" → command resume &lt;key&gt; |
-| `resume_command` | string |  |  | ResumeCommand is the full shell command to run when resuming a session. Supports &#123;&#123;.SessionKey&#125;&#125; template variable. When set, takes precedence over ResumeFlag/ResumeStyle. Example:   "claude --resume &#123;&#123;.SessionKey&#125;&#125; --dangerously-skip-permissions" |
+| `resume_command` | string |  |  | ResumeCommand is the full shell command to run when resuming a session. Supports only the &#123;&#123;.SessionKey&#125;&#125; template variable. When set, takes precedence over ResumeFlag/ResumeStyle. When schema-managed defaults are inserted, the resolver tokenizes and re-emits the command; for subcommand-style resume it inserts after the ResumeFlag token that precedes &#123;&#123;.SessionKey&#125;&#125;. Example:   "claude --resume &#123;&#123;.SessionKey&#125;&#125; --dangerously-skip-permissions" Schema-managed defaults missing from a subcommand-style resume command are inserted before &#123;&#123;.SessionKey&#125;&#125; during provider resolution. |
 | `session_id_flag` | string |  |  | SessionIDFlag is the CLI flag for creating a session with a specific ID. Enables the Generate & Pass strategy for session key management. Example: "--session-id" (claude) |
-| `permission_modes` | map[string]string |  |  | PermissionModes maps permission mode names to CLI flags. Example: &#123;"unrestricted": "--dangerously-skip-permissions", "plan": "--permission-mode plan"&#125; This is a config-only lookup table consumed by external clients (e.g., Mission Control) to populate permission mode dropdowns. Launch-time flag substitution is planned for a follow-up PR — currently no runtime code reads this field. |
+| `permission_modes` | map[string]string |  |  | PermissionModes maps permission mode names to CLI flags. Example: &#123;"unrestricted": "--dangerously-skip-permissions", "plan": "--permission-mode plan"&#125; This is a config-only lookup table consumed by external clients (e.g., real-world app) to populate permission mode dropdowns. Launch-time flag substitution is planned for a follow-up PR — currently no runtime code reads this field. |
 | `option_defaults` | map[string]string |  |  | OptionDefaults overrides the Default value in OptionsSchema entries without redefining the schema itself. Keys are option keys (e.g., "permission_mode"), values are choice values (e.g., "unrestricted"). city.toml users set this to customize provider behavior without touching Args or OptionsSchema. |
 | `options_schema` | []ProviderOption |  |  | OptionsSchema declares the configurable options this provider supports. Each option maps to CLI args via its Choices[].FlagArgs field. Serialized via a dedicated DTO (not directly to JSON) so FlagArgs stays server-side. |
 | `print_args` | []string |  |  | PrintArgs are CLI arguments that enable one-shot non-interactive mode. The provider prints its response to stdout and exits. When empty, the provider does not support one-shot invocation. Examples: ["-p"] (claude, gemini), ["exec"] (codex) |
@@ -490,6 +520,7 @@ Rig defines an external project registered in the city.
 | `name` | string | **yes** |  | Name is the unique identifier for this rig. |
 | `path` | string |  |  | Path is the absolute filesystem path to the rig's repository. |
 | `prefix` | string |  |  | Prefix overrides the auto-derived bead ID prefix for this rig. |
+| `default_branch` | string |  |  | DefaultBranch is the rig repository's mainline branch (e.g. "main", "master", "develop"). When set, routing formulas use this as the default merge target instead of probing origin/HEAD at sling time. Captured by `gc rig add` from the rig's git config; set manually for rigs whose mainline isn't reachable via origin/HEAD. |
 | `suspended` | boolean |  |  | Suspended prevents the reconciler from spawning agents in this rig. Toggle with gc rig suspend/resume. |
 | `formulas_dir` | string |  |  | FormulasDir is a rig-local formula directory (Layer 4). Overrides pack formulas for this rig by filename. Relative paths resolve against the city directory. |
 | `includes` | []string |  |  | Includes lists pack directories or URLs for this rig (V1 mechanism). Each entry is a local path, a git source//sub#ref URL, or a GitHub tree URL. |
@@ -511,6 +542,7 @@ RigPatch modifies an existing rig identified by Name.
 | `name` | string | **yes** |  | Name is the targeting key (required). Must match an existing rig's name. |
 | `path` | string |  |  | Path overrides the rig's filesystem path. |
 | `prefix` | string |  |  | Prefix overrides the bead ID prefix. |
+| `default_branch` | string |  |  | DefaultBranch overrides the rig's recorded mainline branch. |
 | `suspended` | boolean |  |  | Suspended overrides the rig's suspended state. |
 
 ## Service
@@ -583,6 +615,17 @@ SessionSleepConfig configures default idle sleep policies by session class.
 | `interactive_fresh` | string |  |  | InteractiveFresh applies to attachable sessions using wake_mode=fresh. Accepts a duration string or "off". |
 | `noninteractive` | string |  |  | NonInteractive applies to sessions with attach=false. Accepts a duration string or "off". |
 
+## Tier
+
+Tier defines per-token-type rates in USD per 1 million tokens.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `prompt_usd_per_1m` | number | **yes** |  |  |
+| `completion_usd_per_1m` | number | **yes** |  |  |
+| `cache_read_usd_per_1m` | number | **yes** |  |  |
+| `cache_creation_usd_per_1m` | number | **yes** |  |  |
+
 ## Workspace
 
 Workspace holds city-level metadata and optional defaults that apply to all agents unless overridden per-agent.
@@ -596,7 +639,7 @@ Workspace holds city-level metadata and optional defaults that apply to all agen
 | `suspended` | boolean |  |  | Suspended controls whether the city is suspended. When true, all agents are effectively suspended: the reconciler won't spawn them, and gc hook/prime return empty. Inherits downward — individual agent/rig suspended fields are checked independently. |
 | `max_active_sessions` | integer |  |  | MaxActiveSessions is the workspace-level cap on total concurrent sessions. Nil means unlimited. Agents and rigs inherit this if they don't set their own. |
 | `session_template` | string |  |  | SessionTemplate is a template string supporting placeholders: &#123;&#123;.City&#125;&#125;, &#123;&#123;.Agent&#125;&#125; (sanitized), &#123;&#123;.Dir&#125;&#125;, &#123;&#123;.Name&#125;&#125;. Controls tmux session naming. Default (empty): "&#123;&#123;.Agent&#125;&#125;" — just the sanitized agent name. Per-city tmux socket isolation makes a city prefix unnecessary. |
-| `install_agent_hooks` | []string |  |  | InstallAgentHooks lists provider names whose hooks should be installed into agent working directories. Agent-level overrides workspace-level (replace, not additive). Supported: "claude", "codex", "gemini", "opencode", "copilot", "cursor", "pi", "omp". |
+| `install_agent_hooks` | []string |  |  | InstallAgentHooks lists provider names whose hooks should be installed into agent working directories. Agent-level overrides workspace-level (replace, not additive). Supported: "claude", "codex", "gemini", "kiro", "opencode", "copilot", "cursor", "pi", "omp". |
 | `global_fragments` | []string |  |  | GlobalFragments lists named template fragments injected into every agent's rendered prompt. Applied before per-agent InjectFragments. Each name must match a &#123;&#123; define "name" &#125;&#125; block from a pack's prompts/shared/ directory. |
 | `includes` | []string |  |  | Includes lists pack directories or URLs to compose into this workspace. Replaces the older pack/packs fields. Each entry is a local path, a git source//sub#ref URL, or a GitHub tree URL. |
 | `default_rig_includes` | []string |  |  | DefaultRigIncludes lists pack directories applied to new rigs when "gc rig add" is called without --include. Allows cities to define a default pack for all rigs. |
