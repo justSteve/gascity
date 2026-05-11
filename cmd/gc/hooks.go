@@ -27,7 +27,7 @@ PAYLOAD=$(printf '{"bead":%%s}' "$DATA")
 title=$(echo "$DATA" | grep -o '"title":"[^"]*"' | head -1 | cut -d'"' -f4)
 (
   "$GC_BIN" event emit %s --subject "$1" --message "$title" --payload "$PAYLOAD" >/dev/null 2>&1 || true
-) </dev/null >/dev/null 2>&1 &
+) </dev/null >/dev/null 2>&1
 `, eventType)
 }
 
@@ -51,7 +51,7 @@ title=$(echo "$DATA" | grep -o '"title":"[^"]*"' | head -1 | cut -d'"' -f4)
   "$GC_BIN" convoy autoclose "$1" >/dev/null 2>&1 || true
   # Auto-close open molecule/wisp children so they don't outlive the parent.
   "$GC_BIN" wisp autoclose "$1" >/dev/null 2>&1 || true
-) </dev/null >/dev/null 2>&1 &
+) </dev/null >/dev/null 2>&1
 `
 }
 

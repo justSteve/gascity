@@ -428,6 +428,8 @@ func applyResolvedCityDoltEnv(env map[string]string, cityPath string, allowRecov
 	if ok {
 		applyCanonicalDoltTargetEnv(env, target)
 		fallbackUser = strings.TrimSpace(target.User)
+	} else {
+		env["BEADS_DOLT_SERVER_MODE"] = "0"
 	}
 	applyResolvedDoltAuthEnv(env, cityPath, fallbackUser)
 	mirrorBeadsDoltEnv(env)
