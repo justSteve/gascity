@@ -23,6 +23,9 @@ shutdown_timeout = "5s"
 formula_v2 = true
 
 # Register zgent repos as rigs to activate rig-scoped agents:
-# [[rigs]]
-# name = "zgent-name"
-# path = "/root/projects/ZgentName"
+
+[[rigs]]
+name = "strader"
+path = "/root/projects/Strader"
+prefix = "st"
+includes = ["packs/strader"]
