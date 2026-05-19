@@ -2816,6 +2816,7 @@ gc start
 |------|------|---------|-------------|
 | `-n`, `--dry-run` | bool |  | preview what agents would start without starting them |
 | `--no-auto-restart` | bool |  | detect supervisor binary drift but do not auto-restart; exits non-zero on drift |
+| `--verbose` | bool |  | disable warning deduplication and print every supervisor warning |
 
 ## gc status
 
@@ -3158,8 +3159,12 @@ gc wait cancel <wait-id>
 Show details for a wait
 
 ```
-gc wait inspect <wait-id>
+gc wait inspect <wait-id> [flags]
 ```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--json` | bool |  | emit JSON |
 
 ## gc wait list
 
@@ -3171,6 +3176,7 @@ gc wait list [flags]
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
+| `--json` | bool |  | emit JSON |
 | `--session` | string |  | filter by session ID |
 | `--state` | string |  | filter by wait state |
 
