@@ -211,6 +211,23 @@ func readProcStartTimeTicks(pid int) uint64 {
 	return parseProcStartTimeTicks(data)
 }
 
+// readProcStartIdentity returns `ps -p <pid> -o lstart=` output (the portable
+// per-process start timestamp) for the given PID. Empty string on any error
+// or non-zero exit — callers treat empty as "identity unavailable" and fall
+// back to less-strict verification.
+func readProcStartIdentity(pid int) string {
+	if pid <= 0 {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), procEnumerationTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "ps", "-p", strconv.Itoa(pid), "-o", "lstart=").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
 func parseProcStartTimeTicks(data []byte) uint64 {
 	text := string(data)
 	closeParen := strings.LastIndex(text, ")")
@@ -329,18 +346,39 @@ func consumeLeadingFields(s string, n int) ([]string, string) {
 }
 
 func parseDoltPSCommandLine(command string) []string {
-	fields := strings.Fields(command)
-	if len(fields) == 0 {
+	command = strings.TrimSpace(command)
+	if command == "" {
 		return nil
 	}
-	if len(fields) < 2 || filepath.Base(fields[0]) != "dolt" || fields[1] != "sql-server" {
+	tail, ok := doltSQLServerPSTail(command)
+	if !ok {
+		return strings.Fields(command)
+	}
+	fields := strings.Fields(tail)
+	if len(fields) < 2 {
 		return fields
 	}
 	argv := []string{fields[0], fields[1]}
-	if cfg, ok := configPathFromPSCommandLine(command); ok {
+	if cfg, ok := configPathFromPSCommandLine(tail); ok {
 		argv = append(argv, "--config", cfg)
 	}
 	return argv
+}
+
+func doltSQLServerPSTail(command string) (string, bool) {
+	const marker = "dolt sql-server"
+	for start := 0; start < len(command); {
+		i := strings.Index(command[start:], marker)
+		if i < 0 {
+			return "", false
+		}
+		i += start
+		if i == 0 || command[i-1] == filepath.Separator || command[i-1] == '/' || command[i-1] == '\\' {
+			return command[i:], true
+		}
+		start = i + len("dolt")
+	}
+	return "", false
 }
 
 func configPathFromPSCommandLine(command string) (string, bool) {

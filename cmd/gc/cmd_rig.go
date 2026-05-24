@@ -406,10 +406,15 @@ func doRigAddWithResult(fs fsys.FS, cityPath, rigPath string, includes []string,
 	}
 
 	// Guard: on a fresh add (not a re-add) without --adopt, refuse to run
-	// if .beads/ is already present. Without this, doRigAdd falls through
-	// to bd init against an existing Dolt store and typically dies with
-	// "bd init: signal: killed" after the probe times out — an unhelpful
-	// failure mode for the common "register existing store" workflow.
+	// if .beads/ already holds a beads store. Without this, doRigAdd falls
+	// through to bd init against an existing Dolt store and typically dies
+	// with "bd init: signal: killed" after the probe times out.
+	//
+	// We treat .beads/ as a store only when metadata.json or config.yaml is
+	// present. A directory that happens to be named .beads/ but contains
+	// only unrelated content (e.g. the beads project's own .beads/formulas/
+	// convention for formula source files) is not a store, so the init path
+	// decides how to create the missing store files in place.
 	if !reAdd && !adopt {
 		beadsPath := filepath.Join(rigPath, ".beads")
 		fi, err := fs.Stat(beadsPath)
@@ -418,10 +423,17 @@ func doRigAddWithResult(fs fsys.FS, cityPath, rigPath string, includes []string,
 			return config.Rig{}, 1
 		}
 		if err == nil && fi.IsDir() {
-			fmt.Fprintf(stderr, "gc rig add: %s/.beads already exists; "+ //nolint:errcheck // best-effort stderr
-				"use --adopt to register the existing store, or remove %s/.beads to reinitialize\n",
-				rigPath, rigPath)
-			return config.Rig{}, 1
+			containsStore, containsErr := beadsDirContainsStore(fs, beadsPath)
+			if containsErr != nil {
+				fmt.Fprintf(stderr, "gc rig add: %v\n", containsErr) //nolint:errcheck // best-effort stderr
+				return config.Rig{}, 1
+			}
+			if containsStore {
+				fmt.Fprintf(stderr, "gc rig add: %s/.beads already contains a beads store; "+ //nolint:errcheck // best-effort stderr
+					"use --adopt to register it, or remove %s/.beads to reinitialize\n",
+					rigPath, rigPath)
+				return config.Rig{}, 1
+			}
 		}
 	}
 
@@ -835,8 +847,163 @@ func cmdRigList(args []string, jsonOutput bool, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "gc rig list: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
+	c, reason := rigListAPIClient(cityPath)
+	return routeRigList(cityPath, c, reason, jsonOutput, stdout, stderr)
+}
+
+// rigListAPIClient returns (client, "") when the API path is available, or
+// (nil, reason) when the caller should fall back. Indirected through a var
+// so tests inject a client pointed at httptest.Server or force a specific
+// fallback reason without spinning up a real controller.
+var rigListAPIClient = func(cityPath string) (*api.Client, string) {
+	if c := apiClient(cityPath); c != nil {
+		return c, ""
+	}
+	return nil, apiClientFallbackReason(cityPath)
+}
+
+// routeRigList dispatches the `rig list` read to the supervisor API when
+// available, falling back to doRigList when the controller is down, the
+// escape hatch is set, or the API returns a fallbackable error. Emits
+// exactly one route=... log line per exit path (gated on GC_DEBUG).
+func routeRigList(cityPath string, c *api.Client, nilReason string, jsonOutput bool, stdout, stderr io.Writer) int {
+	const cmdName = "rig list"
+	if c != nil {
+		cr, err := c.ListRigs()
+		if err == nil {
+			logRoute(stderr, cmdName, "api", "")
+			return renderRigListFromAPI(fsys.OSFS{}, cityPath, cr, jsonOutput, stdout, stderr)
+		}
+		if !api.ShouldFallbackForRead(err) {
+			logRoute(stderr, cmdName, "api", "error")
+			fmt.Fprintf(stderr, "gc rig list: %v\n", err) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+		logRoute(stderr, cmdName, "fallback", api.FallbackReason(err))
+	} else {
+		logRoute(stderr, cmdName, "fallback", nilReason)
+	}
 	return doRigList(fsys.OSFS{}, cityPath, jsonOutput, stdout, stderr)
 }
+
+// renderRigListFromAPI formats the API-sourced rig list to match doRigList
+// output. HQ info and per-rig beads status are derived locally (neither
+// lives on the API response); configured rigs come from the API with an
+// _cache_age_s envelope field (JSON) or staleness banner (human).
+func renderRigListFromAPI(fs fsys.FS, cityPath string, cr api.CachedRead[[]api.RigView], jsonOutput bool, stdout, stderr io.Writer) int {
+	cfg, err := loadCityConfigFS(fs, filepath.Join(cityPath, "city.toml"), stderr)
+	if err != nil {
+		fmt.Fprintf(stderr, "gc rig list: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	hqPrefix := config.EffectiveHQPrefix(cfg)
+	cityName := cfg.EffectiveCityName()
+	resolveRigPaths(cityPath, cfg.Rigs)
+	rigsByName := make(map[string]config.Rig, len(cfg.Rigs))
+	for i := range cfg.Rigs {
+		rigsByName[cfg.Rigs[i].Name] = cfg.Rigs[i]
+	}
+
+	if jsonOutput {
+		cacheAgeS := cr.AgeSeconds
+		result := RigListJSON{
+			SchemaVersion: "1",
+			CityPath:      cityPath,
+			CityName:      cityName,
+			CacheAgeS:     &cacheAgeS,
+			Rigs: []RigListItem{{
+				Name:    cityName,
+				Path:    cityPath,
+				Prefix:  hqPrefix,
+				HQ:      true,
+				Running: true,
+				Beads:   rigBeadsStatus(fs, cityPath),
+			}},
+		}
+		for _, rig := range cr.Body {
+			path := rig.Path
+			prefix := rig.Prefix
+			defaultBranch := rig.DefaultBranch
+			defaultSlingTarget := ""
+			if cfgRig, ok := rigsByName[rig.Name]; ok {
+				path = cfgRig.Path
+				prefix = cfgRig.EffectivePrefix()
+				defaultBranch = cfgRig.EffectiveDefaultBranch()
+				defaultSlingTarget = cfgRig.DefaultSlingTarget
+			}
+			result.Rigs = append(result.Rigs, RigListItem{
+				Name:               rig.Name,
+				Path:               path,
+				Prefix:             prefix,
+				DefaultBranch:      defaultBranch,
+				Suspended:          rig.Suspended,
+				Running:            rig.RunningCount > 0,
+				DefaultSlingTarget: defaultSlingTarget,
+				Beads:              rigBeadsStatus(fs, path),
+			})
+		}
+		result.Summary.Total = len(result.Rigs)
+		for _, rig := range result.Rigs {
+			if rig.Suspended {
+				result.Summary.Suspended++
+			}
+			if rig.Running {
+				result.Summary.Running++
+			}
+		}
+		if err := writeCLIJSONLine(stdout, result); err != nil {
+			fmt.Fprintf(stderr, "gc rig list: %v\n", err) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+		return 0
+	}
+
+	w := func(s string) { fmt.Fprintln(stdout, s) } //nolint:errcheck // best-effort stdout
+	w("")
+	w(fmt.Sprintf("Rigs in %s:", cityPath))
+
+	hqBeads := rigBeadsStatus(fs, cityPath)
+	displayName := loadedCityName(cfg, cityPath)
+	w("")
+	w(fmt.Sprintf("  %s (HQ):", displayName))
+	w(fmt.Sprintf("    Prefix: %s", hqPrefix))
+	w(fmt.Sprintf("    Beads:  %s", hqBeads))
+
+	for _, rig := range cr.Body {
+		path := rig.Path
+		prefix := rig.Prefix
+		defaultBranch := rig.DefaultBranch
+		if cfgRig, ok := rigsByName[rig.Name]; ok {
+			path = cfgRig.Path
+			prefix = cfgRig.EffectivePrefix()
+			defaultBranch = cfgRig.EffectiveDefaultBranch()
+		}
+		beads := rigBeadsStatus(fs, path)
+		header := rig.Name
+		if rig.Suspended {
+			header += " (suspended)"
+		}
+		w("")
+		w(fmt.Sprintf("  %s:", header))
+		w(fmt.Sprintf("    Path:   %s", path))
+		w(fmt.Sprintf("    Prefix: %s", prefix))
+		if defaultBranch != "" {
+			w(fmt.Sprintf("    Default branch: %s", defaultBranch))
+		}
+		w(fmt.Sprintf("    Beads:  %s", beads))
+	}
+
+	if cr.AgeSeconds > cacheAgeBannerThresholdSeconds {
+		w("")
+		w(fmt.Sprintf("(cache age: %.0fs — reconciler may be lagging)", cr.AgeSeconds))
+	}
+	return 0
+}
+
+// cacheAgeBannerThresholdSeconds is the cache-age cutoff above which human
+// output appends the "reconciler may be lagging" banner. Matches the
+// enabler contract D5 documented in the ga-h6w plan.
+const cacheAgeBannerThresholdSeconds = 30.0
 
 // RigListJSON is the JSON output format for "gc rig list --json".
 type RigListJSON struct {
@@ -845,6 +1012,7 @@ type RigListJSON struct {
 	CityName      string         `json:"city_name"`
 	Rigs          []RigListItem  `json:"rigs"`
 	Summary       RigListSummary `json:"summary"`
+	CacheAgeS     *float64       `json:"_cache_age_s,omitempty"`
 }
 
 // RigListItem is one rig entry in the JSON output.
@@ -999,6 +1167,8 @@ func rigHasRunningAgent(cfg *config.City, rigName string) bool {
 }
 
 // rigBeadsStatus returns a human-readable beads status for a directory.
+// It reports only fully initialized stores; the rig-add guard below uses a
+// broader "dangerous to initialize over" check for partial store evidence.
 func rigBeadsStatus(fs fsys.FS, dir string) string {
 	metaPath := filepath.Join(dir, ".beads", "metadata.json")
 	if _, err := fs.Stat(metaPath); err == nil {
@@ -1279,7 +1449,7 @@ func cmdRigRemove(rigName string, stdout, stderr io.Writer) int {
 	cfg.Rigs = filtered
 
 	// Write updated config.
-	if err := writeCityConfigForEditFS(fsys.OSFS{}, tomlPath, cfg); err != nil {
+	if err := config.WriteCityAndRigSiteBindingsForEditRemovingRigs(fsys.OSFS{}, tomlPath, cfg, rigName); err != nil {
 		fmt.Fprintf(stderr, "gc rig remove: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
@@ -1337,6 +1507,22 @@ func writeBeadsEnvGTRoot(fs fsys.FS, rigPath, cityPath string) error {
 		return fmt.Errorf("creating .beads dir: %w", err)
 	}
 	return fs.WriteFile(envPath, []byte(content), 0o644)
+}
+
+// beadsDirContainsStore reports whether beadsPath contains evidence that it
+// would be dangerous to initialize over. Either canonical marker is enough to
+// stop fresh initialization because partial stores should fail closed; only
+// missing marker files are ignored.
+func beadsDirContainsStore(fs fsys.FS, beadsPath string) (bool, error) {
+	for _, name := range [...]string{"metadata.json", "config.yaml"} {
+		path := filepath.Join(beadsPath, name)
+		if _, err := fs.Stat(path); err == nil {
+			return true, nil
+		} else if !os.IsNotExist(err) {
+			return false, fmt.Errorf("checking %s: %w", path, err)
+		}
+	}
+	return false, nil
 }
 
 // readBeadsPrefix reads the issue_prefix from an existing .beads/config.yaml

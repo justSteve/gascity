@@ -140,6 +140,9 @@ func TestOrphanSweepPreservesQualifiedRigAssignees(t *testing.T) {
 
 	writeExecutable(t, filepath.Join(binDir, "gc"), `#!/bin/sh
 printf '%s\n' "$*" >> "$GC_CALL_LOG"
+if [ "$1" = "--rig" ]; then
+  shift 2
+fi
 case "$1" in
   config)
     if [ "$2" = "explain" ]; then
@@ -154,13 +157,19 @@ EOF
       exit 0
     fi
     ;;
-  rig)
-    if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
-      printf '{"rigs":[{"name":"hq","hq":true},{"name":"project","hq":false}]}\n'
-      exit 0
-    fi
-    ;;
-  bd)
+	  rig)
+	    if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
+	      printf '{"rigs":[{"name":"hq","hq":true},{"name":"project","hq":false}]}\n'
+	      exit 0
+	    fi
+	    ;;
+	  session)
+	    if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
+	      printf '{"sessions":[],"summary":{},"filters":{},"schema_version":"1"}\n'
+	      exit 0
+	    fi
+	    ;;
+	  bd)
     if [ "$2" = "list" ]; then
       case "$*" in
         *"--rig project"*)
@@ -226,6 +235,9 @@ func TestOrphanSweepConfigShowFallbackPreservesQualifiedAssignees(t *testing.T) 
 
 	writeExecutable(t, filepath.Join(binDir, "gc"), `#!/bin/sh
 printf '%s\n' "$*" >> "$GC_CALL_LOG"
+if [ "$1" = "--rig" ]; then
+  shift 2
+fi
 case "$1" in
   config)
     if [ "$2" = "explain" ]; then
@@ -241,13 +253,19 @@ EOF
       exit 0
     fi
     ;;
-  rig)
-    if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
-      printf '{"rigs":[{"name":"hq","hq":true},{"name":"project","hq":false}]}\n'
-      exit 0
-    fi
-    ;;
-  bd)
+	  rig)
+	    if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
+	      printf '{"rigs":[{"name":"hq","hq":true},{"name":"project","hq":false}]}\n'
+	      exit 0
+	    fi
+	    ;;
+	  session)
+	    if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
+	      printf '{"sessions":[],"summary":{},"filters":{},"schema_version":"1"}\n'
+	      exit 0
+	    fi
+	    ;;
+	  bd)
     if [ "$2" = "list" ]; then
       case "$*" in
         *"--rig project"*)
@@ -306,6 +324,486 @@ exit 1
 		if strings.Contains(log, "bd update "+preserved+" ") {
 			t.Fatalf("valid assignee %s was reset:\n%s", preserved, log)
 		}
+	}
+}
+
+func TestOrphanSweepPreservesLiveEphemeralSessionAssignees(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+
+	writeExecutable(t, filepath.Join(binDir, "gc"), `#!/bin/sh
+printf '%s\n' "$*" >> "$GC_CALL_LOG"
+case "$1" in
+  config)
+    if [ "$2" = "explain" ]; then
+      cat <<'EOF'
+Agent: project/worker
+  source: pack
+EOF
+      exit 0
+    fi
+    ;;
+  rig)
+    if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
+      printf '{"rigs":[{"name":"hq","hq":true}]}\n'
+      exit 0
+    fi
+    ;;
+  session)
+    if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
+      cat <<'EOF'
+{"sessions":[
+  {"id":"mc-live","session_name":"project__worker-gc-abc123","alias":"project/worker-1","agent_name":"project/worker","closed":false},
+  {"id":"mc-closed","session_name":"closed-session","closed":true}
+],"summary":{},"filters":{},"schema_version":"1"}
+EOF
+      exit 0
+    fi
+    ;;
+  bd)
+    if [ "$2" = "list" ]; then
+      cat <<'EOF'
+[
+  {"id":"ga-live","status":"in_progress","assignee":"project__worker-gc-abc123"},
+  {"id":"ga-orphan","status":"in_progress","assignee":"missing-session"}
+]
+EOF
+      exit 0
+    fi
+    if [ "$2" = "update" ]; then
+      exit 0
+    fi
+    ;;
+esac
+exit 1
+`)
+
+	env := map[string]string{
+		"GC_CITY":      cityDir,
+		"GC_CITY_PATH": cityDir,
+		"GC_CALL_LOG":  gcLog,
+		"PATH":         binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+	}
+
+	script := filepath.Join(exampleDir(), "packs", "maintenance", "assets", "scripts", "orphan-sweep.sh")
+	cmd := exec.Command(script)
+	cmd.Env = mergeTestEnv(env)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("%s failed: %v\n%s", filepath.Base(script), err, out)
+	}
+	if !strings.Contains(string(out), "orphan-sweep: reset 1 orphaned beads") {
+		t.Fatalf("unexpected orphan-sweep output:\n%s", out)
+	}
+
+	logData, err := os.ReadFile(gcLog)
+	if err != nil {
+		t.Fatalf("ReadFile(gc log): %v", err)
+	}
+	log := string(logData)
+	if !strings.Contains(log, "bd update ga-orphan --status=open --assignee=") {
+		t.Fatalf("orphan bead was not reset:\n%s", log)
+	}
+	if strings.Contains(log, "bd update ga-live ") {
+		t.Fatalf("live ephemeral session assignee was reset:\n%s", log)
+	}
+}
+
+func TestOrphanSweepRefreshesLivenessAfterBeadList(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	tmpDir := t.TempDir()
+	gcLog := filepath.Join(tmpDir, "gc.log")
+	sessionCountFile := filepath.Join(tmpDir, "session-count")
+
+	writeExecutable(t, filepath.Join(binDir, "gc"), `#!/bin/sh
+printf '%s\n' "$*" >> "$GC_CALL_LOG"
+case "$1" in
+  config)
+    if [ "$2" = "explain" ]; then
+      cat <<'EOF'
+Agent: project/worker
+  source: pack
+EOF
+      exit 0
+    fi
+    ;;
+  rig)
+    if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
+      printf '{"rigs":[{"name":"hq","hq":true}]}\n'
+      exit 0
+    fi
+    ;;
+  session)
+    if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
+      count="$(cat "$GC_SESSION_COUNT_FILE" 2>/dev/null || printf '0')"
+      count=$((count + 1))
+      printf '%s' "$count" > "$GC_SESSION_COUNT_FILE"
+      if [ "$count" -eq 1 ]; then
+        printf '{"sessions":[],"summary":{},"filters":{},"schema_version":"1"}\n'
+      else
+        cat <<'EOF'
+{"sessions":[
+  {"id":"mc-live","session_name":"project__worker-gc-race","alias":"project/worker-1","agent_name":"project/worker","closed":false}
+],"summary":{},"filters":{},"schema_version":"1"}
+EOF
+      fi
+      exit 0
+    fi
+    ;;
+  bd)
+    if [ "$2" = "list" ]; then
+      cat <<'EOF'
+[
+  {"id":"ga-live-race","status":"in_progress","assignee":"project__worker-gc-race"}
+]
+EOF
+      exit 0
+    fi
+    if [ "$2" = "update" ]; then
+      exit 0
+    fi
+    ;;
+esac
+exit 1
+`)
+
+	env := map[string]string{
+		"GC_CITY":               cityDir,
+		"GC_CITY_PATH":          cityDir,
+		"GC_CALL_LOG":           gcLog,
+		"GC_SESSION_COUNT_FILE": sessionCountFile,
+		"PATH":                  binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+	}
+
+	script := filepath.Join(exampleDir(), "packs", "maintenance", "assets", "scripts", "orphan-sweep.sh")
+	cmd := exec.Command(script)
+	cmd.Env = mergeTestEnv(env)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("%s failed: %v\n%s", filepath.Base(script), err, out)
+	}
+	if strings.Contains(string(out), "orphan-sweep: reset") {
+		t.Fatalf("unexpected orphan reset output:\n%s", out)
+	}
+
+	logData, err := os.ReadFile(gcLog)
+	if err != nil {
+		t.Fatalf("ReadFile(gc log): %v", err)
+	}
+	log := string(logData)
+	if got := strings.Count(log, "session list --json"); got != 2 {
+		t.Fatalf("session list count = %d, want 2 post-bd refresh:\n%s", got, log)
+	}
+	if strings.Contains(log, "bd update ga-live-race ") {
+		t.Fatalf("live session claimed between liveness and bead list was reset:\n%s", log)
+	}
+}
+
+func TestOrphanSweepRefreshesRigLivenessAfterBeadList(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	tmpDir := t.TempDir()
+	gcLog := filepath.Join(tmpDir, "gc.log")
+	rigSessionCountFile := filepath.Join(tmpDir, "rig-session-count")
+
+	writeExecutable(t, filepath.Join(binDir, "gc"), `#!/bin/sh
+printf '%s\n' "$*" >> "$GC_CALL_LOG"
+if [ "$1" = "--rig" ]; then
+  rig="$2"
+  shift 2
+else
+  rig=""
+fi
+case "$1" in
+  config)
+    if [ "$2" = "explain" ]; then
+      cat <<'EOF'
+Agent: project/worker
+  source: pack
+EOF
+      exit 0
+    fi
+    ;;
+  rig)
+    if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
+      printf '{"rigs":[{"name":"hq","hq":true},{"name":"project","hq":false}]}\n'
+      exit 0
+    fi
+    ;;
+  session)
+    if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
+      if [ "$rig" = "project" ]; then
+        count="$(cat "$GC_RIG_SESSION_COUNT_FILE" 2>/dev/null || printf '0')"
+        count=$((count + 1))
+        printf '%s' "$count" > "$GC_RIG_SESSION_COUNT_FILE"
+        if [ "$count" -eq 1 ]; then
+          printf '{"sessions":[],"summary":{},"filters":{},"schema_version":"1"}\n'
+        else
+          cat <<'EOF'
+{"sessions":[
+  {"id":"mc-rig-live","session_name":"project__worker-gc-race","alias":"project/worker-1","agent_name":"project/worker","closed":false}
+],"summary":{},"filters":{},"schema_version":"1"}
+EOF
+        fi
+        exit 0
+      fi
+      printf '{"sessions":[],"summary":{},"filters":{},"schema_version":"1"}\n'
+      exit 0
+    fi
+    ;;
+  bd)
+    if [ "$2" = "list" ]; then
+      if [ "$rig" = "project" ]; then
+        cat <<'EOF'
+[
+  {"id":"ga-rig-live-race","status":"in_progress","assignee":"project__worker-gc-race"}
+]
+EOF
+      else
+        printf '[]\n'
+      fi
+      exit 0
+    fi
+    if [ "$2" = "update" ]; then
+      exit 0
+    fi
+    ;;
+esac
+exit 1
+`)
+
+	env := map[string]string{
+		"GC_CITY":                   cityDir,
+		"GC_CITY_PATH":              cityDir,
+		"GC_CALL_LOG":               gcLog,
+		"GC_RIG_SESSION_COUNT_FILE": rigSessionCountFile,
+		"PATH":                      binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+	}
+
+	script := filepath.Join(exampleDir(), "packs", "maintenance", "assets", "scripts", "orphan-sweep.sh")
+	cmd := exec.Command(script)
+	cmd.Env = mergeTestEnv(env)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("%s failed: %v\n%s", filepath.Base(script), err, out)
+	}
+	if strings.Contains(string(out), "orphan-sweep: reset") {
+		t.Fatalf("unexpected orphan reset output:\n%s", out)
+	}
+
+	logData, err := os.ReadFile(gcLog)
+	if err != nil {
+		t.Fatalf("ReadFile(gc log): %v", err)
+	}
+	log := string(logData)
+	if got := strings.Count(log, "session list --json"); got != 4 {
+		t.Fatalf("session list count = %d, want 4 including rig post-bd refresh:\n%s", got, log)
+	}
+	if strings.Contains(log, "bd update ga-rig-live-race ") {
+		t.Fatalf("rig live session claimed between liveness and bead list was reset:\n%s", log)
+	}
+}
+
+func TestOrphanSweepPreservesRigScopedLiveEphemeralSessionAssignees(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+
+	writeExecutable(t, filepath.Join(binDir, "gc"), `#!/bin/sh
+printf '%s\n' "$*" >> "$GC_CALL_LOG"
+if [ "$1" = "--rig" ]; then
+  rig="$2"
+  shift 2
+else
+  rig=""
+fi
+case "$1" in
+  config)
+    if [ "$2" = "explain" ]; then
+      cat <<'EOF'
+Agent: project/worker
+  source: pack
+EOF
+      exit 0
+    fi
+    ;;
+  rig)
+    if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
+      printf '{"rigs":[{"name":"hq","hq":true},{"name":"project","hq":false}]}\n'
+      exit 0
+    fi
+    ;;
+  session)
+    if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
+      if [ "$rig" = "project" ]; then
+        cat <<'EOF'
+{"sessions":[
+  {"id":"mc-live-rig","session_name":"project__worker-gc-rig123","alias":"project/worker-1","agent_name":"project/worker","closed":false}
+],"summary":{},"filters":{},"schema_version":"1"}
+EOF
+        exit 0
+      fi
+      printf '{"sessions":[],"summary":{},"filters":{},"schema_version":"1"}\n'
+      exit 0
+    fi
+    ;;
+  bd)
+    if [ "$2" = "list" ]; then
+      if [ "$4" = "project" ]; then
+        cat <<'EOF'
+[
+  {"id":"ga-rig-live","status":"in_progress","assignee":"project__worker-gc-rig123"},
+  {"id":"ga-rig-orphan","status":"in_progress","assignee":"missing-rig-session"}
+]
+EOF
+      else
+        printf '[]\n'
+      fi
+      exit 0
+    fi
+    if [ "$2" = "update" ]; then
+      exit 0
+    fi
+    ;;
+esac
+exit 1
+`)
+
+	env := map[string]string{
+		"GC_CITY":      cityDir,
+		"GC_CITY_PATH": cityDir,
+		"GC_CALL_LOG":  gcLog,
+		"PATH":         binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+	}
+
+	script := filepath.Join(exampleDir(), "packs", "maintenance", "assets", "scripts", "orphan-sweep.sh")
+	cmd := exec.Command(script)
+	cmd.Env = mergeTestEnv(env)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("%s failed: %v\n%s", filepath.Base(script), err, out)
+	}
+	if !strings.Contains(string(out), "orphan-sweep: reset 1 orphaned beads") {
+		t.Fatalf("unexpected orphan-sweep output:\n%s", out)
+	}
+
+	logData, err := os.ReadFile(gcLog)
+	if err != nil {
+		t.Fatalf("ReadFile(gc log): %v", err)
+	}
+	log := string(logData)
+	if !strings.Contains(log, "--rig project session list --json") {
+		t.Fatalf("rig-scoped session list was not queried:\n%s", log)
+	}
+	if !strings.Contains(log, "bd update ga-rig-orphan --status=open --assignee=") {
+		t.Fatalf("rig orphan bead was not reset:\n%s", log)
+	}
+	if strings.Contains(log, "bd update ga-rig-live ") {
+		t.Fatalf("rig live ephemeral session assignee was reset:\n%s", log)
+	}
+}
+
+func TestOrphanSweepContinuesAfterSingleRigSessionListFailure(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+
+	writeExecutable(t, filepath.Join(binDir, "gc"), `#!/bin/sh
+printf '%s\n' "$*" >> "$GC_CALL_LOG"
+if [ "$1" = "--rig" ]; then
+  rig="$2"
+  shift 2
+else
+  rig=""
+fi
+case "$1" in
+  config)
+    if [ "$2" = "explain" ]; then
+      cat <<'EOF'
+Agent: project/worker
+  source: pack
+EOF
+      exit 0
+    fi
+    ;;
+  rig)
+    if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
+      printf '{"rigs":[{"name":"hq","hq":true},{"name":"broken","hq":false},{"name":"healthy","hq":false}]}\n'
+      exit 0
+    fi
+    ;;
+  session)
+    if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
+      if [ "$rig" = "broken" ]; then
+        exit 1
+      fi
+      printf '{"sessions":[],"summary":{},"filters":{},"schema_version":"1"}\n'
+      exit 0
+    fi
+    ;;
+  bd)
+    if [ "$2" = "list" ]; then
+      if [ "$3" = "--rig" ] && [ "$4" = "broken" ]; then
+        cat <<'EOF'
+[
+  {"id":"ga-broken-orphan","status":"in_progress","assignee":"missing-broken-session"}
+]
+EOF
+      elif [ "$3" = "--rig" ] && [ "$4" = "healthy" ]; then
+        cat <<'EOF'
+[
+  {"id":"ga-healthy-orphan","status":"in_progress","assignee":"missing-healthy-session"}
+]
+EOF
+      else
+        cat <<'EOF'
+[
+  {"id":"ga-hq-orphan","status":"in_progress","assignee":"missing-hq-session"}
+]
+EOF
+      fi
+      exit 0
+    fi
+    if [ "$2" = "update" ]; then
+      exit 0
+    fi
+    ;;
+esac
+exit 1
+`)
+
+	env := map[string]string{
+		"GC_CITY":      cityDir,
+		"GC_CITY_PATH": cityDir,
+		"GC_CALL_LOG":  gcLog,
+		"PATH":         binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+	}
+
+	script := filepath.Join(exampleDir(), "packs", "maintenance", "assets", "scripts", "orphan-sweep.sh")
+	cmd := exec.Command(script)
+	cmd.Env = mergeTestEnv(env)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("%s failed: %v\n%s", filepath.Base(script), err, out)
+	}
+	if !strings.Contains(string(out), "orphan-sweep: reset 2 orphaned beads") {
+		t.Fatalf("unexpected orphan-sweep output:\n%s", out)
+	}
+
+	logData, err := os.ReadFile(gcLog)
+	if err != nil {
+		t.Fatalf("ReadFile(gc log): %v", err)
+	}
+	log := string(logData)
+	for _, reset := range []string{"ga-hq-orphan", "ga-healthy-orphan"} {
+		if !strings.Contains(log, "bd update "+reset+" --status=open --assignee=") {
+			t.Fatalf("expected %s to be reset after partial rig failure:\n%s", reset, log)
+		}
+	}
+	if strings.Contains(log, "bd update ga-broken-orphan ") {
+		t.Fatalf("bead from rig with unknown session liveness was reset:\n%s", log)
 	}
 }
 
@@ -850,6 +1348,254 @@ func TestMaintenanceDoltScriptsRejectInvalidManagedPort(t *testing.T) {
 	}
 }
 
+func TestReaperMessageWispsAboveAlertThresholdDoNotTriggerReapFailureAnomaly(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	doltLog := filepath.Join(t.TempDir(), "dolt-args.log")
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+
+	writeExecutable(t, filepath.Join(binDir, "dolt"), `#!/bin/sh
+printf '%s\n' "$*" >> "$DOLT_ARGS_LOG"
+case "$*" in
+  *"SHOW TABLES FROM"*"LIKE 'wisps'"*)
+    printf 'Tables_in_db\nwisps\n'
+    ;;
+  *"SHOW DATABASES"*)
+    printf 'Database\nbeads\n'
+    ;;
+  *"issue_type NOT IN"*)
+    printf 'COUNT(*)\n0\n'
+    ;;
+  *"issue_type = 'message'"*)
+    printf 'COUNT(*)\n600\n'
+    ;;
+  *"created_at < DATE_SUB"*)
+    printf 'COUNT(*)\n0\n'
+    ;;
+  *"status IN ('open', 'hooked', 'in_progress')"*)
+    printf 'COUNT(*)\n600\n'
+    ;;
+  *"COUNT("*)
+    printf 'COUNT(*)\n0\n'
+    ;;
+  *"SELECT id"*)
+    printf 'id\n'
+    ;;
+esac
+exit 0
+`)
+	writeExecutable(t, filepath.Join(binDir, "gc"), `#!/bin/sh
+printf '%s\n' "$*" >> "$GC_CALL_LOG"
+exit 0
+`)
+
+	env := map[string]string{
+		"DOLT_ARGS_LOG":             doltLog,
+		"GC_CALL_LOG":               gcLog,
+		"GC_CITY":                   cityDir,
+		"GC_CITY_PATH":              cityDir,
+		"GC_DOLT_HOST":              "127.0.0.1",
+		"GC_DOLT_PORT":              "3307",
+		"GC_DOLT_USER":              "root",
+		"GC_DOLT_PASSWORD":          "",
+		"GC_REAPER_ALERT_THRESHOLD": "500",
+		"PATH":                      binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+	}
+
+	runScript(t, filepath.Join(exampleDir(), "packs", "maintenance", "assets", "scripts", "reaper.sh"), env)
+
+	gcData, err := os.ReadFile(gcLog)
+	if err != nil {
+		t.Fatalf("ReadFile(gc log): %v", err)
+	}
+	gcLogText := string(gcData)
+	if strings.Contains(gcLogText, "ESCALATION") {
+		t.Fatalf("reaper fired false-positive escalation for message-type wisps above alert threshold:\n%s", gcLogText)
+	}
+	if !strings.Contains(gcLogText, "mail_wisps:600") {
+		t.Fatalf("reaper summary missing mail_wisps:600 for message-type wisp backlog:\n%s", gcLogText)
+	}
+}
+
+func TestReaperNonMessageWispsAboveAlertThresholdStillTriggerReapFailureAnomaly(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	doltLog := filepath.Join(t.TempDir(), "dolt-args.log")
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+
+	writeExecutable(t, filepath.Join(binDir, "dolt"), `#!/bin/sh
+printf '%s\n' "$*" >> "$DOLT_ARGS_LOG"
+case "$*" in
+  *"SHOW TABLES FROM"*"LIKE 'wisps'"*)
+    printf 'Tables_in_db\nwisps\n'
+    ;;
+  *"SHOW DATABASES"*)
+    printf 'Database\nbeads\n'
+    ;;
+  *"issue_type NOT IN"*)
+    printf 'COUNT(*)\n600\n'
+    ;;
+  *"issue_type = 'message'"*)
+    printf 'COUNT(*)\n0\n'
+    ;;
+  *"created_at < DATE_SUB"*)
+    printf 'COUNT(*)\n0\n'
+    ;;
+  *"status IN ('open', 'hooked', 'in_progress')"*)
+    printf 'COUNT(*)\n600\n'
+    ;;
+  *"COUNT("*)
+    printf 'COUNT(*)\n0\n'
+    ;;
+  *"SELECT id"*)
+    printf 'id\n'
+    ;;
+esac
+exit 0
+`)
+	writeExecutable(t, filepath.Join(binDir, "gc"), `#!/bin/sh
+printf '%s\n' "$*" >> "$GC_CALL_LOG"
+exit 0
+`)
+
+	env := map[string]string{
+		"DOLT_ARGS_LOG":             doltLog,
+		"GC_CALL_LOG":               gcLog,
+		"GC_CITY":                   cityDir,
+		"GC_CITY_PATH":              cityDir,
+		"GC_DOLT_HOST":              "127.0.0.1",
+		"GC_DOLT_PORT":              "3307",
+		"GC_DOLT_USER":              "root",
+		"GC_DOLT_PASSWORD":          "",
+		"GC_REAPER_ALERT_THRESHOLD": "500",
+		"PATH":                      binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+	}
+
+	runScript(t, filepath.Join(exampleDir(), "packs", "maintenance", "assets", "scripts", "reaper.sh"), env)
+
+	gcData, err := os.ReadFile(gcLog)
+	if err != nil {
+		t.Fatalf("ReadFile(gc log): %v", err)
+	}
+	gcLogText := string(gcData)
+	if !strings.Contains(gcLogText, "ESCALATION: Reaper anomalies detected [MEDIUM]") {
+		t.Fatalf("reaper did not fire reap-failure anomaly for non-message wisps above threshold:\n%s", gcLogText)
+	}
+	if !strings.Contains(gcLogText, "open wisps (threshold: 500)") {
+		t.Fatalf("reaper anomaly body missing open wisp count format:\n%s", gcLogText)
+	}
+}
+
+func TestReaperMailAlertThresholdPositiveBranchEmitsMailBacklogAnomaly(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	doltLog := filepath.Join(t.TempDir(), "dolt-args.log")
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+
+	writeExecutable(t, filepath.Join(binDir, "dolt"), `#!/bin/sh
+printf '%s\n' "$*" >> "$DOLT_ARGS_LOG"
+case "$*" in
+  *"SHOW TABLES FROM"*"LIKE 'wisps'"*)
+    printf 'Tables_in_db\nwisps\n'
+    ;;
+  *"SHOW DATABASES"*)
+    printf 'Database\nbeads\n'
+    ;;
+  *"issue_type NOT IN"*)
+    printf 'COUNT(*)\n0\n'
+    ;;
+  *"issue_type = 'message'"*)
+    printf 'COUNT(*)\n300\n'
+    ;;
+  *"created_at < DATE_SUB"*)
+    printf 'COUNT(*)\n0\n'
+    ;;
+  *"status IN ('open', 'hooked', 'in_progress')"*)
+    printf 'COUNT(*)\n300\n'
+    ;;
+  *"COUNT("*)
+    printf 'COUNT(*)\n0\n'
+    ;;
+  *"SELECT id"*)
+    printf 'id\n'
+    ;;
+esac
+exit 0
+`)
+	writeExecutable(t, filepath.Join(binDir, "gc"), `#!/bin/sh
+printf '%s\n' "$*" >> "$GC_CALL_LOG"
+exit 0
+`)
+
+	env := map[string]string{
+		"DOLT_ARGS_LOG":                  doltLog,
+		"GC_CALL_LOG":                    gcLog,
+		"GC_CITY":                        cityDir,
+		"GC_CITY_PATH":                   cityDir,
+		"GC_DOLT_HOST":                   "127.0.0.1",
+		"GC_DOLT_PORT":                   "3307",
+		"GC_DOLT_USER":                   "root",
+		"GC_DOLT_PASSWORD":               "",
+		"GC_REAPER_ALERT_THRESHOLD":      "500",
+		"GC_REAPER_MAIL_ALERT_THRESHOLD": "200",
+		"PATH":                           binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+	}
+
+	runScript(t, filepath.Join(exampleDir(), "packs", "maintenance", "assets", "scripts", "reaper.sh"), env)
+
+	gcData, err := os.ReadFile(gcLog)
+	if err != nil {
+		t.Fatalf("ReadFile(gc log): %v", err)
+	}
+	gcLogText := string(gcData)
+	if !strings.Contains(gcLogText, "ESCALATION: Reaper anomalies detected [MEDIUM]") {
+		t.Fatalf("reaper did not fire mail backlog anomaly above mail threshold:\n%s", gcLogText)
+	}
+	if !strings.Contains(gcLogText, "open mail-wisps (mail threshold: 200)") {
+		t.Fatalf("reaper anomaly body missing mail backlog threshold format:\n%s", gcLogText)
+	}
+	if strings.Contains(gcLogText, "open wisps (threshold: 500)") {
+		t.Fatalf("reaper fired reapable-wisp anomaly for message-only backlog:\n%s", gcLogText)
+	}
+}
+
+func TestReaperMailWispsSummaryFieldAlwaysPresent(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	doltLog := filepath.Join(t.TempDir(), "dolt-args.log")
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+
+	writeMaintenanceDoltStub(t, filepath.Join(binDir, "dolt"))
+	writeExecutable(t, filepath.Join(binDir, "gc"), `#!/bin/sh
+printf '%s\n' "$*" >> "$GC_CALL_LOG"
+exit 0
+`)
+
+	env := map[string]string{
+		"DOLT_ARGS_LOG":    doltLog,
+		"DOLT_DBS":         "beads",
+		"GC_CALL_LOG":      gcLog,
+		"GC_CITY":          cityDir,
+		"GC_CITY_PATH":     cityDir,
+		"GC_DOLT_HOST":     "127.0.0.1",
+		"GC_DOLT_PORT":     "3307",
+		"GC_DOLT_USER":     "root",
+		"GC_DOLT_PASSWORD": "",
+		"PATH":             binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+	}
+
+	runScript(t, filepath.Join(exampleDir(), "packs", "maintenance", "assets", "scripts", "reaper.sh"), env)
+
+	gcData, err := os.ReadFile(gcLog)
+	if err != nil {
+		t.Fatalf("ReadFile(gc log): %v", err)
+	}
+	gcLogText := string(gcData)
+	if !strings.Contains(gcLogText, "mail_wisps:0") {
+		t.Fatalf("reaper summary missing mail_wisps field when wisp counts are zero:\n%s", gcLogText)
+	}
+}
+
 func TestMaintenanceDoltScriptsSkipTestPatternDatabases(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -1270,12 +2016,14 @@ exit 0
 		t.Fatalf("reaper ran dependency-aware queries against legacy dependency schema:\n%s", log)
 	}
 
+	// A silently-skipped DB may make no gc calls at all, so a missing
+	// gc log is a valid no-escalation outcome.
 	gcData, err := os.ReadFile(gcLog)
-	if err != nil {
+	if err != nil && !os.IsNotExist(err) {
 		t.Fatalf("ReadFile(gc log): %v", err)
 	}
-	if !strings.Contains(string(gcData), "dependencies table lacks split target columns") {
-		t.Fatalf("reaper did not surface legacy dependency schema anomaly:\n%s", gcData)
+	if strings.Contains(string(gcData), "dependencies table lacks split target columns") {
+		t.Errorf("reaper escalated the legacy dependency schema as an anomaly; the split-target gate must skip silently:\n%s", gcData)
 	}
 }
 

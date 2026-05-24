@@ -106,6 +106,7 @@ export type AgentPatch = {
     SleepAfterIdle: string | null;
     StartCommand: string | null;
     Suspended: boolean | null;
+    TmuxAlias: string | null;
     WakeMode: string | null;
     WorkDir: string | null;
 };
@@ -133,6 +134,10 @@ export type AgentPatchSetInputBody = {
      * Override suspended state.
      */
     suspended?: boolean;
+    /**
+     * Override tmux session name template.
+     */
+    tmux_alias?: string;
     /**
      * Override session working directory.
      */
@@ -749,7 +754,7 @@ export type EventEmitRequest = {
     type: string;
 };
 
-export type EventPayload = AdapterEventPayload | BeadEventPayload | BoundEventPayload | CityCreateSucceededPayload | CityLifecyclePayload | CityUnregisterSucceededPayload | GroupCreatedEventPayload | InboundEventPayload | MailEventPayload | NoPayload | OutboundEventPayload | ProjectIdentityStampedPayload | RequestFailedPayload | RotatedPayload | SessionCreateSucceededPayload | SessionDrainAckedWithAssignedWorkPayload | SessionLifecyclePayload | SessionMessageSucceededPayload | SessionSubmitSucceededPayload | SupervisorFsPressureSkippedTickPayload | SupervisorShutdownPayload | UnboundEventPayload | WorkerOperationEventPayload;
+export type EventPayload = AdapterEventPayload | BeadEventPayload | BoundEventPayload | CityCreateSucceededPayload | CityLifecyclePayload | CityUnregisterSucceededPayload | GroupCreatedEventPayload | InboundEventPayload | MailEventPayload | NoPayload | OutboundEventPayload | ProjectIdentityStampedPayload | RequestFailedPayload | RotatedPayload | SessionCreateSucceededPayload | SessionDrainAckedWithAssignedWorkPayload | SessionLifecyclePayload | SessionMessageSucceededPayload | SessionSubmitSucceededPayload | StoreMaintenanceDonePayload | StoreMaintenanceFailedPayload | SupervisorFsPressureSkippedTickPayload | SupervisorShutdownPayload | UnboundEventPayload | WorkerOperationEventPayload;
 
 export type EventRotateAnchor = {
     /**
@@ -2762,11 +2767,58 @@ export type StatusAgentCounts = {
     total: number;
 };
 
+export type StatusAgentDetail = {
+    /**
+     * True when the pool is draining this instance.
+     */
+    draining?: boolean;
+    /**
+     * True when this row is a pool-expanded instance (renderer indents differently).
+     */
+    expanded?: boolean;
+    /**
+     * Pool group label for expanded rows; same as QualifiedName for singletons.
+     */
+    group_name?: string;
+    /**
+     * Unqualified agent name (for pool instances, the per-instance short name like 'polecat-1').
+     */
+    name: string;
+    /**
+     * Rig-qualified name when applicable, else the bare agent name.
+     */
+    qualified_name: string;
+    /**
+     * Observed running state of the agent's session.
+     */
+    running: boolean;
+    /**
+     * 'scaled (min=N, max=M)' header emitted once per pool group.
+     */
+    scale_label?: string;
+    /**
+     * city or rig.
+     */
+    scope: string;
+    /**
+     * tmux session name CLI drain-ops key on.
+     */
+    session_name?: string;
+    /**
+     * Whether the agent (or its rig) is suspended.
+     */
+    suspended: boolean;
+};
+
 export type StatusBody = {
     /**
      * Total agent count (deprecated, use agents.total).
      */
     agent_count: number;
+    /**
+     * Per-agent state (for CLI status views). Empty when none.
+     */
+    agent_details?: Array<StatusAgentDetail> | null;
     /**
      * Agent state counts.
      */
@@ -2779,6 +2831,10 @@ export type StatusBody = {
      * City name.
      */
     name: string;
+    /**
+     * Per-named-session detail. Empty when none configured.
+     */
+    named_session_details?: Array<StatusNamedSessionDetail> | null;
     /**
      * True when one or more status backing reads returned incomplete data.
      */
@@ -2796,6 +2852,10 @@ export type StatusBody = {
      */
     rig_count: number;
     /**
+     * Per-rig detail (for CLI status views). Empty when none.
+     */
+    rig_details?: Array<StatusRigDetail> | null;
+    /**
      * Rig state counts.
      */
     rigs: StatusRigCounts;
@@ -2803,6 +2863,14 @@ export type StatusBody = {
      * Number of running agent processes.
      */
     running: number;
+    /**
+     * Active/suspended session counts. Omitted when unavailable.
+     */
+    session_counts_detail?: StatusSessionCountsDetail;
+    /**
+     * Dolt bead store health summary. Omitted when unavailable.
+     */
+    store_health?: StatusStoreHealth;
     /**
      * Whether the city is suspended.
      */
@@ -2832,6 +2900,21 @@ export type StatusMailCounts = {
     unread: number;
 };
 
+export type StatusNamedSessionDetail = {
+    /**
+     * Qualified named-session identity.
+     */
+    identity: string;
+    /**
+     * Named-session mode (on-demand, always, etc.).
+     */
+    mode: string;
+    /**
+     * Lifecycle status string (materialized, reserved-unmaterialized, etc.).
+     */
+    status: string;
+};
+
 export type StatusRigCounts = {
     /**
      * Number of suspended rigs.
@@ -2841,6 +2924,67 @@ export type StatusRigCounts = {
      * Total number of rigs.
      */
     total: number;
+};
+
+export type StatusRigDetail = {
+    /**
+     * Rig name.
+     */
+    name: string;
+    /**
+     * Rig directory path.
+     */
+    path: string;
+    /**
+     * Whether the rig is suspended (either explicitly or because all its agents are suspended).
+     */
+    suspended: boolean;
+};
+
+export type StatusSessionCountsDetail = {
+    /**
+     * Number of active sessions.
+     */
+    active: number;
+    /**
+     * Number of suspended sessions.
+     */
+    suspended: number;
+};
+
+export type StatusStoreHealth = {
+    /**
+     * RFC3339 timestamp of last maintenance run.
+     */
+    last_gc_at?: string;
+    /**
+     * Status of last maintenance run ('success' or 'failed').
+     */
+    last_gc_status?: string;
+    /**
+     * Live bead row count.
+     */
+    live_rows: number;
+    /**
+     * On-disk path of the Dolt store.
+     */
+    path: string;
+    /**
+     * Derived megabytes per row.
+     */
+    ratio_mb_per_row: number;
+    /**
+     * Total bytes of the store directory.
+     */
+    size_bytes: number;
+    /**
+     * Ratio threshold; a ratio above this trips warning.
+     */
+    threshold_mb_per_row: number;
+    /**
+     * True when maintenance is overdue.
+     */
+    warning: boolean;
 };
 
 export type StatusWorkCounts = {
@@ -2856,6 +3000,20 @@ export type StatusWorkCounts = {
      * Number of ready work items.
      */
     ready: number;
+};
+
+export type StoreMaintenanceDonePayload = {
+    after_bytes: number;
+    before_bytes: number;
+    duration_s: number;
+    snapshot_path: string;
+};
+
+export type StoreMaintenanceFailedPayload = {
+    duration_s: number;
+    error_msg: string;
+    snapshot_path?: string;
+    stage: string;
 };
 
 export type SubmissionCapabilities = {
@@ -3046,6 +3204,10 @@ export type TypedEventStreamEnvelope = ({
 } & TypedEventStreamEnvelopeExtmsgOutbound) | ({
     type: 'extmsg.unbound';
 } & TypedEventStreamEnvelopeExtmsgUnbound) | ({
+    type: 'gc.store.maintenance.done';
+} & TypedEventStreamEnvelopeGcStoreMaintenanceDone) | ({
+    type: 'gc.store.maintenance.failed';
+} & TypedEventStreamEnvelopeGcStoreMaintenanceFailed) | ({
     type: 'mail.archived';
 } & TypedEventStreamEnvelopeMailArchived) | ({
     type: 'mail.deleted';
@@ -3096,6 +3258,8 @@ export type TypedEventStreamEnvelope = ({
 } & TypedEventStreamEnvelopeSessionQuarantined) | ({
     type: 'session.stopped';
 } & TypedEventStreamEnvelopeSessionStopped) | ({
+    type: 'session.stranded';
+} & TypedEventStreamEnvelopeSessionStranded) | ({
     type: 'session.suspended';
 } & TypedEventStreamEnvelopeSessionSuspended) | ({
     type: 'session.undrained';
@@ -3392,6 +3556,34 @@ export type TypedEventStreamEnvelopeExtmsgUnbound = {
     subject?: string;
     ts: string;
     type: 'extmsg.unbound';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
+ * TypedEventStreamEnvelope gc.store.maintenance.done
+ */
+export type TypedEventStreamEnvelopeGcStoreMaintenanceDone = {
+    actor: string;
+    message?: string;
+    payload: StoreMaintenanceDonePayload;
+    seq: number;
+    subject?: string;
+    ts: string;
+    type: 'gc.store.maintenance.done';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
+ * TypedEventStreamEnvelope gc.store.maintenance.failed
+ */
+export type TypedEventStreamEnvelopeGcStoreMaintenanceFailed = {
+    actor: string;
+    message?: string;
+    payload: StoreMaintenanceFailedPayload;
+    seq: number;
+    subject?: string;
+    ts: string;
+    type: 'gc.store.maintenance.failed';
     workflow?: WorkflowEventProjection;
 };
 
@@ -3746,6 +3938,20 @@ export type TypedEventStreamEnvelopeSessionStopped = {
 };
 
 /**
+ * TypedEventStreamEnvelope session.stranded
+ */
+export type TypedEventStreamEnvelopeSessionStranded = {
+    actor: string;
+    message?: string;
+    payload: NoPayload;
+    seq: number;
+    subject?: string;
+    ts: string;
+    type: 'session.stranded';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
  * TypedEventStreamEnvelope session.suspended
  */
 export type TypedEventStreamEnvelopeSessionSuspended = {
@@ -3901,6 +4107,10 @@ export type TypedTaggedEventStreamEnvelope = ({
 } & TypedTaggedEventStreamEnvelopeExtmsgOutbound) | ({
     type: 'extmsg.unbound';
 } & TypedTaggedEventStreamEnvelopeExtmsgUnbound) | ({
+    type: 'gc.store.maintenance.done';
+} & TypedTaggedEventStreamEnvelopeGcStoreMaintenanceDone) | ({
+    type: 'gc.store.maintenance.failed';
+} & TypedTaggedEventStreamEnvelopeGcStoreMaintenanceFailed) | ({
     type: 'mail.archived';
 } & TypedTaggedEventStreamEnvelopeMailArchived) | ({
     type: 'mail.deleted';
@@ -3951,6 +4161,8 @@ export type TypedTaggedEventStreamEnvelope = ({
 } & TypedTaggedEventStreamEnvelopeSessionQuarantined) | ({
     type: 'session.stopped';
 } & TypedTaggedEventStreamEnvelopeSessionStopped) | ({
+    type: 'session.stranded';
+} & TypedTaggedEventStreamEnvelopeSessionStranded) | ({
     type: 'session.suspended';
 } & TypedTaggedEventStreamEnvelopeSessionSuspended) | ({
     type: 'session.undrained';
@@ -4267,6 +4479,36 @@ export type TypedTaggedEventStreamEnvelopeExtmsgUnbound = {
     subject?: string;
     ts: string;
     type: 'extmsg.unbound';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
+ * TypedTaggedEventStreamEnvelope gc.store.maintenance.done
+ */
+export type TypedTaggedEventStreamEnvelopeGcStoreMaintenanceDone = {
+    actor: string;
+    city: string;
+    message?: string;
+    payload: StoreMaintenanceDonePayload;
+    seq: number;
+    subject?: string;
+    ts: string;
+    type: 'gc.store.maintenance.done';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
+ * TypedTaggedEventStreamEnvelope gc.store.maintenance.failed
+ */
+export type TypedTaggedEventStreamEnvelopeGcStoreMaintenanceFailed = {
+    actor: string;
+    city: string;
+    message?: string;
+    payload: StoreMaintenanceFailedPayload;
+    seq: number;
+    subject?: string;
+    ts: string;
+    type: 'gc.store.maintenance.failed';
     workflow?: WorkflowEventProjection;
 };
 
@@ -4642,6 +4884,21 @@ export type TypedTaggedEventStreamEnvelopeSessionStopped = {
     subject?: string;
     ts: string;
     type: 'session.stopped';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
+ * TypedTaggedEventStreamEnvelope session.stranded
+ */
+export type TypedTaggedEventStreamEnvelopeSessionStranded = {
+    actor: string;
+    city: string;
+    message?: string;
+    payload: NoPayload;
+    seq: number;
+    subject?: string;
+    ts: string;
+    type: 'session.stranded';
     workflow?: WorkflowEventProjection;
 };
 
@@ -6075,6 +6332,10 @@ export type GetV0CityByCityNameBeadsData = {
          * Filter by rig.
          */
         rig?: string;
+        /**
+         * Include closed beads.
+         */
+        all?: boolean;
     };
     url: '/v0/city/{cityName}/beads';
 };
@@ -9570,6 +9831,10 @@ export type GetV0CityByCityNameSessionByIdData = {
          * Include last output preview.
          */
         peek?: boolean;
+        /**
+         * Number of lines to include in the last output preview when peek=true. Defaults to 5.
+         */
+        peek_lines?: number;
     };
     url: '/v0/city/{cityName}/session/{id}';
 };

@@ -43,6 +43,7 @@ gc [flags]
 | [gc hook](#gc-hook) | Check for available work |
 | [gc import](#gc-import) | Manage pack imports |
 | [gc init](#gc-init) | Initialize a new city |
+| [gc lint](#gc-lint) | Validate a pack before merge |
 | [gc mail](#gc-mail) | Send and receive messages between agents and humans |
 | [gc mcp](#gc-mcp) | Inspect projected MCP config |
 | [gc nudge](#gc-nudge) | Inspect and deliver deferred nudges |
@@ -98,9 +99,9 @@ agents/&lt;name&gt;/agent.toml. These files live in the city directory and do
 not append [[agent]] blocks to city.toml.
 
 Use --prompt-template to copy prompt content from an existing file into
-the canonical prompt.template.md location. Use --dir to record a rig or
-working-directory prefix in agent.toml. Use --suspended to scaffold the
-agent in a suspended state.
+the canonical prompt.template.md location. Schema-2 convention agents are
+city-scoped; define rig-scoped agents in pack config or [[patches.agent]].
+Use --suspended to scaffold the agent in a suspended state.
 
 ```
 gc agent add --name <name> [flags]
@@ -110,13 +111,13 @@ gc agent add --name <name> [flags]
 
 ```
 gc agent add --name mayor
-  gc agent add --name polecat --dir my-project
+  gc agent add --name polecat
   gc agent add --name worker --prompt-template ./worker.md --suspended
 ```
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--dir` | string |  | Working directory for the agent (relative to city root) |
+| `--dir` | string |  | Legacy working directory for schema-1 agents; schema-2 convention agents are city-scoped |
 | `--json` | bool |  | Output in JSONL format |
 | `--name` | string |  | Name of the agent |
 | `--prompt-template` | string |  | Path to prompt template file (relative to city root) |
@@ -272,7 +273,9 @@ gc bd --rig my-project list
 
 Manage the beads provider (backing store for issue tracking).
 
-Subcommands for topology operations, health checking, and diagnostics.
+Subcommands for topology operations, health checking, diagnostics, and
+read-only list/show routed through the supervisor API with transparent
+fallback to direct bd reads.
 
 ```
 gc beads
@@ -282,6 +285,8 @@ gc beads
 |------------|-------------|
 | [gc beads city](#gc-beads-city) | Manage canonical city endpoint topology |
 | [gc beads health](#gc-beads-health) | Check beads provider health |
+| [gc beads list](#gc-beads-list) | List beads (API-routed with bd fallback) |
+| [gc beads show](#gc-beads-show) | Show a single bead (API-routed with bd fallback) |
 
 ## gc beads city
 
@@ -353,6 +358,49 @@ gc beads health
 |------|------|---------|-------------|
 | `--json` | bool |  | emit JSON result |
 | `--quiet` | bool |  | silent on success, stderr on failure |
+
+## gc beads list
+
+List beads across all rigs, routed through the supervisor API when
+the controller is alive and falling back to a direct multi-store read
+otherwise.
+
+Supports --label, --status, --all, and --format flags. --json is an
+alias for --format=json. API-path JSON output includes _cache_age_s;
+fallback-path JSON omits it.
+
+```
+gc beads list
+```
+
+**Example:**
+
+```
+gc beads list
+  gc beads list --label ready-to-build
+  gc beads list --status open --json
+  gc beads list --format=toon
+```
+
+## gc beads show
+
+Show one bead by ID, routed through the supervisor API when the
+controller is alive and falling back to a direct multi-store lookup
+otherwise.
+
+Supports --format and --json. API-path JSON output includes
+_cache_age_s; fallback-path JSON omits it.
+
+```
+gc beads show <bead-id>
+```
+
+**Example:**
+
+```
+gc beads show ga-abc
+  gc beads show ga-abc --json
+```
 
 ## gc build-image
 
@@ -767,7 +815,7 @@ gc converge test-gate <bead-id> [flags]
 Manage convoys — graphs of related work beads.
 
 A convoy is a named graph of beads with dependencies. Convoys
-group related issues via parent-child relationships.
+group related issues via tracks dependencies.
 
 Convoys are distinct from workflows (graph.v2 formula-compiled
 DAGs managed by the dispatch subsystem) — gc convoy commands do
@@ -797,8 +845,8 @@ gc convoy
 
 Link an existing issue bead to a convoy.
 
-Sets the issue's parent to the convoy ID, making it appear in the
-convoy's progress tracking.
+Adds a tracks dependency from the convoy to the issue, making it appear
+in the convoy's progress tracking without changing the issue parent.
 
 ```
 gc convoy add <convoy-id> <issue-id> [flags]
@@ -857,8 +905,8 @@ gc convoy control [bead-id] [flags]
 
 Create a convoy and optionally link existing issues to it.
 
-Creates a convoy bead and sets the parent of any provided issue IDs to
-the new convoy. Issues can also be added later with "gc convoy add".
+Creates a convoy bead and tracks any provided issue IDs. Issues can
+also be added later with "gc convoy add".
 
 ```
 gc convoy create <name> [issue-ids...] [flags]
@@ -1544,6 +1592,23 @@ gc init
 | `--preserve-existing` | bool |  | keep any pre-authored pack.toml, city.toml, or agent prompt files instead of overwriting them |
 | `--provider` | string |  | built-in workspace provider to use for the default mayor config |
 | `--skip-provider-readiness` | bool |  | skip provider login/readiness checks during init and continue startup |
+
+## gc lint
+
+Validate a pack before merge.
+
+gc lint &lt;pack&gt; validates the pack.toml file, reports non-fatal loader
+warnings, and parses prompt templates with the same missing-key behavior used
+by runtime prompt rendering. Use gc lint . to recursively find every pack.toml
+below the current directory.
+
+```
+gc lint <pack> [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--json` | bool |  | emit structured JSON report |
 
 ## gc mail
 
@@ -2607,7 +2672,7 @@ gc session
 | [gc session nudge](#gc-session-nudge) | Send a text message to a running session |
 | [gc session peek](#gc-session-peek) | View session output without attaching |
 | [gc session pin](#gc-session-pin) | Keep a session awake |
-| [gc session prune](#gc-session-prune) | Close old suspended sessions |
+| [gc session prune](#gc-session-prune) | Close old dormant sessions |
 | [gc session rename](#gc-session-rename) | Rename a session |
 | [gc session reset](#gc-session-reset) | Restart a session fresh while preserving the bead |
 | [gc session submit](#gc-session-submit) | Submit a message with semantic delivery intent |
@@ -2726,6 +2791,9 @@ When --title-hint is provided without --title, the session title is
 auto-generated from the hint text: a short version is set immediately
 and refined by the title model in the background.
 
+If the template config sets tmux_alias, it controls the runtime tmux
+session_name. --alias still sets the public command and mail alias.
+
 ```
 gc session new <template> [flags]
 ```
@@ -2798,8 +2866,10 @@ gc session pin <session-id-or-alias> [flags]
 
 ## gc session prune
 
-Close suspended sessions older than a given age. Only suspended
-sessions are affected — active sessions are never pruned.
+Close dormant sessions older than a given age. By default only
+suspended sessions are affected — active sessions are never pruned. Pass
+--state to opt asleep or drained sessions into the same cleanup pass; multiple
+states may be comma-separated.
 
 ```
 gc session prune [flags]
@@ -2810,12 +2880,14 @@ gc session prune [flags]
 ```
 gc session prune --before 7d
   gc session prune --before 24h
+  gc session prune --state asleep,suspended,drained --before 1h
 ```
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--before` | string | `7d` | prune sessions older than this duration (e.g., 7d, 24h) |
 | `--json` | bool |  | emit JSONL |
+| `--state` | string | `suspended` | comma-separated states to prune (suspended, asleep, drained) |
 
 ## gc session rename
 

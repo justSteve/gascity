@@ -15,6 +15,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	convoycore "github.com/gastownhall/gascity/internal/convoy"
 	"github.com/gastownhall/gascity/internal/formula"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
@@ -881,11 +882,16 @@ func doSlingBatchWithJSON(opts slingOpts, deps slingDeps, querier BeadChildQueri
 			return writeSlingJSONResult(result, jsonStdout, stderr)
 		}
 		// For batch dry-run, look up the container bead for display.
-		if querier != nil {
+		// DoSling sets ContainerType on the result only when it actually
+		// went down the batch path (i.e. the bead is a container type
+		// like convoy). For leaf tasks it returns the single-bead result
+		// with ContainerType unset — so the dry-run preview must use
+		// dryRunSingle, otherwise it renders the misleading "container
+		// with zero children" output even though the real run would
+		// route the bead itself.
+		if result.ContainerType != "" && querier != nil {
 			if b, getErr := querier.Get(opts.BeadOrFormula); getErr == nil {
-				children, _ := querier.List(beads.ListQuery{
-					ParentID: b.ID, IncludeClosed: true, Sort: beads.SortCreatedAsc,
-				})
+				children, _ := dryRunBatchChildren(querier, b.ID)
 				var open []beads.Bead
 				for _, c := range children {
 					if c.Status == "open" {
@@ -904,6 +910,15 @@ func doSlingBatchWithJSON(opts slingOpts, deps slingDeps, querier BeadChildQueri
 		return writeSlingJSONResult(result, jsonStdout, stderr)
 	}
 	return 0
+}
+
+func dryRunBatchChildren(querier BeadChildQuerier, containerID string) ([]beads.Bead, error) {
+	if store, ok := querier.(beads.Store); ok {
+		return convoycore.Members(store, containerID, true)
+	}
+	return querier.List(beads.ListQuery{
+		ParentID: containerID, IncludeClosed: true, Sort: beads.SortCreatedAsc,
+	})
 }
 
 type slingJSONResult struct {
@@ -1624,7 +1639,9 @@ func dryRunSingle(opts slingOpts, deps slingDeps, querier BeadQuerier, stdout, s
 			printBeadInfo(w, querier, opts.BeadOrFormula)
 			printCrossRigSection(w, opts.BeadOrFormula, a, deps.Cfg)
 
-			check := sling.CheckBeadState(querier, opts.BeadOrFormula, a, deps)
+			check := sling.CheckBeadStateWithOptions(querier, opts.BeadOrFormula, a, deps, sling.BeadCheckOptions{
+				NoConvoy: opts.NoConvoy,
+			})
 			if check.Idempotent {
 				w("Idempotency:")
 				w("  Bead " + opts.BeadOrFormula + " is already routed to " + a.QualifiedName() + ".")
@@ -1743,7 +1760,9 @@ func dryRunBatch(opts slingOpts, deps slingDeps, stdout, _ io.Writer,
 	for _, c := range children {
 		clabel := sling.FormatBeadLabel(c.ID, c.Title)
 		if c.Status == "open" {
-			check := sling.CheckBeadState(querier, c.ID, a, deps)
+			check := sling.CheckBeadStateWithOptions(querier, c.ID, a, deps, sling.BeadCheckOptions{
+				NoConvoy: opts.NoConvoy,
+			})
 			if check.Idempotent {
 				w("    " + clabel + " (open) → already routed (skip)")
 			} else {

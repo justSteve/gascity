@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os/exec"
@@ -119,7 +120,10 @@ after creation.
 
 When --title-hint is provided without --title, the session title is
 auto-generated from the hint text: a short version is set immediately
-and refined by the title model in the background.`,
+and refined by the title model in the background.
+
+If the template config sets tmux_alias, it controls the runtime tmux
+session_name. --alias still sets the public command and mail alias.`,
 		Example: `  gc session new helper
   gc session new helper --alias sky
   gc session new helper --title "debugging auth"
@@ -188,7 +192,8 @@ func cmdSessionNew(args []string, alias, title, titleHint string, noAttach, json
 	if alias != "" && found.SupportsMultipleSessions() {
 		alias = workdirutil.SessionQualifiedName(cityPath, found, cfg.Rigs, requestedAlias, "")
 	}
-	explicitName, err := sessionExplicitNameForNewSession(&found, alias)
+	cityName := loadedCityName(cfg, cityPath)
+	explicitName, err := sessionExplicitNameForNewSession(cityPath, cityName, cfg.Rigs, &found, alias)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session new: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -687,8 +692,169 @@ func newSessionListCmd(stdout, stderr io.Writer) *cobra.Command {
 	return cmd
 }
 
-// cmdSessionList is the CLI entry point for "gc session list".
+// sessionListAPIClient returns (client, "") when the API path is available,
+// or (nil, reason) when the caller should fall back. Indirected through a
+// var so tests inject a client pointed at httptest.Server or force a
+// specific fallback reason without spinning up a real controller.
+var sessionListAPIClient = func(cityPath string) (*api.Client, string) {
+	if c := apiClient(cityPath); c != nil {
+		return c, ""
+	}
+	return nil, apiClientFallbackReason(cityPath)
+}
+
+// routeSessionList dispatches `session list` to the supervisor API when a
+// controller is up; otherwise falls back to the local iterator. Emits
+// exactly one route=... log line per exit path (gated on GC_DEBUG).
+func routeSessionList(_ string, stateFilter, templateFilter string, c *api.Client, nilReason string, jsonOutput bool, stdout, stderr io.Writer) int {
+	const cmdName = "session list"
+	if c != nil {
+		cr, err := c.ListSessions(stateFilter, templateFilter, false)
+		if err == nil {
+			logRoute(stderr, cmdName, "api", "")
+			return renderSessionListFromAPI(cr, jsonOutput, stdout)
+		}
+		if !api.ShouldFallbackForRead(err) {
+			logRoute(stderr, cmdName, "api", "error")
+			fmt.Fprintf(stderr, "gc session list: %v\n", err) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+		logRoute(stderr, cmdName, "fallback", api.FallbackReason(err))
+	} else {
+		logRoute(stderr, cmdName, "fallback", nilReason)
+	}
+	return doSessionListFallback(stateFilter, templateFilter, jsonOutput, stdout, stderr)
+}
+
+// sessionListJSONEnvelope is the API-path --json output shape for
+// `gc session list`. It wraps the items array so _cache_age_s can sit
+// alongside at the envelope level — the shape documented in the
+// ga-h6w designer's D5 contract.
+type sessionListJSONEnvelope struct {
+	CacheAgeS float64       `json:"_cache_age_s"`
+	Sessions  []SessionView `json:"sessions"`
+}
+
+// SessionView mirrors api.SessionView for CLI JSON output. Defined as an
+// alias so cmd/gc/ can document the JSON shape without exposing genclient.
+type SessionView = api.SessionView
+
+// renderSessionListFromAPI formats the API-sourced session list. On --json
+// the output is the sessionListJSONEnvelope with _cache_age_s; human output
+// mirrors the fallback tabwriter format and appends a staleness banner when
+// the supervisor cache age crosses the threshold.
+func renderSessionListFromAPI(cr api.CachedRead[[]SessionView], jsonOutput bool, stdout io.Writer) int {
+	if jsonOutput {
+		env := sessionListJSONEnvelope{
+			CacheAgeS: cr.AgeSeconds,
+			Sessions:  cr.Body,
+		}
+		if env.Sessions == nil {
+			env.Sessions = []SessionView{}
+		}
+		enc := json.NewEncoder(stdout)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(env) //nolint:errcheck // best-effort stdout
+		return 0
+	}
+
+	if len(cr.Body) == 0 {
+		fmt.Fprintln(stdout, "No sessions found.") //nolint:errcheck // best-effort stdout
+		return 0
+	}
+
+	w := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(w, "ID\tTEMPLATE\tSTATE\tREASON\tTARGET\tTITLE\tAGE\tLAST ACTIVE") //nolint:errcheck // best-effort stdout
+	for _, s := range cr.Body {
+		state := s.State
+		if state == "" {
+			state = "closed"
+		}
+		reason := s.Reason
+		if reason == "" {
+			reason = "-"
+		}
+		target := sessionViewTarget(s)
+		title := sessionViewTitle(s)
+		age := sessionViewAge(s.CreatedAt)
+		lastActive := sessionViewLastActive(s.LastActive)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", s.ID, s.Template, state, reason, target, title, age, lastActive) //nolint:errcheck // best-effort stdout
+	}
+	_ = w.Flush() //nolint:errcheck // best-effort stdout
+
+	if cr.AgeSeconds > cacheAgeBannerThresholdSeconds {
+		fmt.Fprintf(stdout, "(cache age: %.0fs — reconciler may be lagging)\n", cr.AgeSeconds) //nolint:errcheck
+	}
+	return 0
+}
+
+// sessionViewTarget mirrors sessionListTarget's fallback behavior, but
+// against the SessionView shape the API returns.
+func sessionViewTarget(s SessionView) string {
+	if s.Alias != "" {
+		return s.Alias
+	}
+	if s.SessionName != "" {
+		return s.SessionName
+	}
+	return "-"
+}
+
+// sessionViewTitle mirrors sessionListTitle against the API-returned shape.
+func sessionViewTitle(s SessionView) string {
+	title := s.Title
+	if title == "" {
+		return "-"
+	}
+	if len(title) > 30 {
+		return title[:27] + "..."
+	}
+	return title
+}
+
+// sessionViewAge formats a CreatedAt RFC3339 string the same way the
+// fallback formats time.Since(s.CreatedAt). Empty or unparseable strings
+// render as "-".
+func sessionViewAge(createdAt string) string {
+	if createdAt == "" {
+		return "-"
+	}
+	t, err := time.Parse(time.RFC3339, createdAt)
+	if err != nil {
+		return "-"
+	}
+	return formatDuration(time.Since(t))
+}
+
+// sessionViewLastActive formats a LastActive RFC3339 string the same way
+// the fallback formats time.Since. Empty or unparseable strings render as
+// "-".
+func sessionViewLastActive(lastActive string) string {
+	if lastActive == "" {
+		return "-"
+	}
+	t, err := time.Parse(time.RFC3339, lastActive)
+	if err != nil {
+		return "-"
+	}
+	return formatDuration(time.Since(t)) + " ago"
+}
+
+// cmdSessionList is the CLI entry point for "gc session list". It routes
+// through the supervisor API when a controller is up and falls back to the
+// local iterator otherwise.
 func cmdSessionList(stateFilter, templateFilter string, jsonOutput bool, stdout, stderr io.Writer) int {
+	cityPath, err := resolveCity()
+	if err != nil {
+		fmt.Fprintf(stderr, "gc session list: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	c, reason := sessionListAPIClient(cityPath)
+	return routeSessionList(cityPath, stateFilter, templateFilter, c, reason, jsonOutput, stdout, stderr)
+}
+
+// doSessionListFallback is the direct-bd path for "gc session list".
+func doSessionListFallback(stateFilter, templateFilter string, jsonOutput bool, stdout, stderr io.Writer) int {
 	storeStderr := stderr
 	if jsonOutput {
 		storeStderr = io.Discard
@@ -1614,31 +1780,42 @@ func cmdSessionRename(args []string, stdout, stderr io.Writer, jsonOutput ...boo
 // newSessionPruneCmd creates the "gc session prune" command.
 func newSessionPruneCmd(stdout, stderr io.Writer) *cobra.Command {
 	var beforeStr string
+	var statesStr string
 	var jsonOutput bool
 	cmd := &cobra.Command{
 		Use:   "prune",
-		Short: "Close old suspended sessions",
-		Long: `Close suspended sessions older than a given age. Only suspended
-sessions are affected — active sessions are never pruned.`,
+		Short: "Close old dormant sessions",
+		Long: `Close dormant sessions older than a given age. By default only
+suspended sessions are affected — active sessions are never pruned. Pass
+--state to opt asleep or drained sessions into the same cleanup pass; multiple
+states may be comma-separated.`,
 		Example: `  gc session prune --before 7d
-  gc session prune --before 24h`,
+  gc session prune --before 24h
+  gc session prune --state asleep,suspended,drained --before 1h`,
 		Args: cobra.NoArgs,
 		RunE: func(_ *cobra.Command, _ []string) error {
-			if cmdSessionPrune(beforeStr, stdout, stderr, jsonOutput) != 0 {
+			if cmdSessionPrune(beforeStr, statesStr, stdout, stderr, jsonOutput) != 0 {
 				return errExit
 			}
 			return nil
 		},
 	}
 	cmd.Flags().StringVar(&beforeStr, "before", "7d", "prune sessions older than this duration (e.g., 7d, 24h)")
+	cmd.Flags().StringVar(&statesStr, "state", "suspended", "comma-separated states to prune (suspended, asleep, drained)")
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "emit JSONL")
 	return cmd
 }
 
 // cmdSessionPrune is the CLI entry point for "gc session prune".
-func cmdSessionPrune(beforeStr string, stdout, stderr io.Writer, jsonOutput ...bool) int {
+func cmdSessionPrune(beforeStr, statesStr string, stdout, stderr io.Writer, jsonOutput ...bool) int {
 	asJSON := sessionJSONRequested(jsonOutput)
 	dur, err := parsePruneDuration(beforeStr)
+	if err != nil {
+		fmt.Fprintf(stderr, "gc session prune: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+
+	states, err := parsePruneStates(statesStr)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session prune: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -1657,7 +1834,7 @@ func cmdSessionPrune(beforeStr string, stdout, stderr io.Writer, jsonOutput ...b
 	}
 
 	cutoff := time.Now().Add(-dur)
-	result, err := catalog.PruneBefore(cutoff)
+	result, err := catalog.PruneBefore(cutoff, states...)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session prune: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -1674,6 +1851,7 @@ func cmdSessionPrune(beforeStr string, stdout, stderr io.Writer, jsonOutput ...b
 			Count:  &result.Count,
 			Before: beforeStr,
 			Cutoff: cutoff.UTC().Format(time.RFC3339),
+			State:  formatPruneStates(states),
 		}); err != nil {
 			fmt.Fprintf(stderr, "gc session prune: %v\n", err) //nolint:errcheck // best-effort stderr
 			return 1
@@ -1686,6 +1864,52 @@ func cmdSessionPrune(beforeStr string, stdout, stderr io.Writer, jsonOutput ...b
 		fmt.Fprintf(stdout, "Pruned %d session(s).\n", result.Count) //nolint:errcheck // best-effort stdout
 	}
 	return 0
+}
+
+// parsePruneStates parses a comma-separated list of session state names
+// for `gc session prune --state`. Only terminal-dormant states are accepted
+// (suspended, asleep, drained) — active or in-flight states are rejected to
+// keep the prune pass safe.
+func parsePruneStates(s string) ([]worker.SessionState, error) {
+	if strings.TrimSpace(s) == "" {
+		return nil, fmt.Errorf("--state must not be empty")
+	}
+	seen := map[worker.SessionState]struct{}{}
+	var out []worker.SessionState
+	for _, raw := range strings.Split(s, ",") {
+		name := strings.ToLower(strings.TrimSpace(raw))
+		if name == "" {
+			continue
+		}
+		var st worker.SessionState
+		switch name {
+		case string(worker.SessionStateSuspended):
+			st = worker.SessionStateSuspended
+		case string(worker.SessionStateAsleep):
+			st = worker.SessionStateAsleep
+		case string(worker.SessionStateDrained):
+			st = worker.SessionStateDrained
+		default:
+			return nil, fmt.Errorf("unsupported state %q (allowed: suspended, asleep, drained)", name)
+		}
+		if _, dup := seen[st]; dup {
+			continue
+		}
+		seen[st] = struct{}{}
+		out = append(out, st)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("--state must list at least one state")
+	}
+	return out, nil
+}
+
+func formatPruneStates(states []worker.SessionState) string {
+	names := make([]string, 0, len(states))
+	for _, state := range states {
+		names = append(names, string(state))
+	}
+	return strings.Join(names, ",")
 }
 
 // parsePruneDuration parses a duration string like "7d", "24h", "30m".
@@ -1746,8 +1970,87 @@ type sessionPeekJSONResult struct {
 	Output        string `json:"output"`
 }
 
-// cmdSessionPeek is the CLI entry point for "gc session peek".
+// sessionPeekAPIClient returns (client, "") when the API path is available,
+// or (nil, reason) when the caller should fall back. Indirected through a
+// var so tests can inject one.
+var sessionPeekAPIClient = func(cityPath string) (*api.Client, string) {
+	if c := apiClient(cityPath); c != nil {
+		return c, ""
+	}
+	return nil, apiClientFallbackReason(cityPath)
+}
+
+// routeSessionPeek dispatches `session peek` to the supervisor API when a
+// controller is up; otherwise falls back to the local runtime provider.
+// Emits exactly one route=... log line per exit path (gated on GC_DEBUG).
+// The API path passes the raw target to the server which resolves aliases;
+// fallback resolves locally via resolveSessionIDWithConfig.
+func routeSessionPeek(_, target string, lines int, c *api.Client, nilReason string, jsonOutput bool, stdout, stderr io.Writer) int {
+	const cmdName = "session peek"
+	if c != nil {
+		cr, err := c.GetSession(target, true, lines)
+		if err == nil {
+			logRoute(stderr, cmdName, "api", "")
+			return renderSessionPeekFromAPI(cr, target, lines, jsonOutput, stdout, stderr)
+		}
+		if !api.ShouldFallbackForRead(err) {
+			logRoute(stderr, cmdName, "api", "error")
+			fmt.Fprintf(stderr, "gc session peek: %v\n", err) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+		logRoute(stderr, cmdName, "fallback", api.FallbackReason(err))
+	} else {
+		logRoute(stderr, cmdName, "fallback", nilReason)
+	}
+	return doSessionPeekFallback(target, lines, jsonOutput, stdout, stderr)
+}
+
+// renderSessionPeekFromAPI writes the API-sourced peek output to stdout,
+// appending a staleness banner on stderr-or-stdout when the supervisor
+// cache age crosses the threshold. Matches the fallback path's text output
+// semantics: trailing newline if the preview doesn't already end in one.
+func renderSessionPeekFromAPI(cr api.CachedRead[api.SessionView], target string, lines int, jsonOutput bool, stdout, stderr io.Writer) int {
+	output := cr.Body.LastOutput
+	if jsonOutput {
+		if err := writeCLIJSONLine(stdout, sessionPeekJSONResult{
+			SchemaVersion: "1",
+			SessionID:     cr.Body.ID,
+			Target:        target,
+			Lines:         lines,
+			LineCount:     outputLineCount(output),
+			Output:        output,
+		}); err != nil {
+			fmt.Fprintf(stderr, "gc session peek: %v\n", err) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+		return 0
+	}
+	fmt.Fprint(stdout, output) //nolint:errcheck // best-effort stdout
+	if !strings.HasSuffix(output, "\n") {
+		fmt.Fprintln(stdout) //nolint:errcheck // best-effort stdout
+	}
+	if cr.AgeSeconds > cacheAgeBannerThresholdSeconds {
+		fmt.Fprintf(stdout, "(cache age: %.0fs — reconciler may be lagging)\n", cr.AgeSeconds) //nolint:errcheck
+	}
+	return 0
+}
+
+// cmdSessionPeek is the CLI entry point for "gc session peek". It routes
+// through the supervisor API when a controller is up and falls back to the
+// local runtime provider otherwise.
 func cmdSessionPeek(args []string, lines int, jsonOutput bool, stdout, stderr io.Writer) int {
+	cityPath, err := resolveCity()
+	if err != nil {
+		fmt.Fprintf(stderr, "gc session peek: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	c, reason := sessionPeekAPIClient(cityPath)
+	return routeSessionPeek(cityPath, args[0], lines, c, reason, jsonOutput, stdout, stderr)
+}
+
+// doSessionPeekFallback is the direct runtime-provider path for
+// "gc session peek".
+func doSessionPeekFallback(target string, lines int, jsonOutput bool, stdout, stderr io.Writer) int {
 	store, code := openCityStore(stderr, "gc session peek")
 	if store == nil {
 		return code
@@ -1758,7 +2061,7 @@ func cmdSessionPeek(args []string, lines int, jsonOutput bool, stdout, stderr io
 	if err == nil {
 		cfg, _ = loadCityConfig(cityPath, stderr)
 	}
-	sessionID, err := resolveSessionIDWithConfig(cityPath, cfg, store, args[0])
+	sessionID, err := resolveSessionIDWithConfig(cityPath, cfg, store, target)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session peek: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -1781,7 +2084,7 @@ func cmdSessionPeek(args []string, lines int, jsonOutput bool, stdout, stderr io
 		if err := writeCLIJSONLine(stdout, sessionPeekJSONResult{
 			SchemaVersion: "1",
 			SessionID:     sessionID,
-			Target:        args[0],
+			Target:        target,
 			Lines:         lines,
 			LineCount:     outputLineCount(output),
 			Output:        output,
@@ -2071,8 +2374,19 @@ func resolveWorkDirForQualifiedName(cityPath string, cfg *config.City, agent *co
 	return resolveConfiguredWorkDir(cityPath, cityName, qualifiedName, agent, rigs)
 }
 
-func sessionExplicitNameForNewSession(agent *config.Agent, alias string) (string, error) {
-	if agent == nil || !agent.SupportsMultipleSessions() || strings.TrimSpace(alias) != "" {
+func sessionExplicitNameForNewSession(cityPath, cityName string, rigs []config.Rig, agent *config.Agent, alias string) (string, error) {
+	if agent == nil {
+		return "", nil
+	}
+	// tmux_alias takes precedence: when set, the resolved name becomes the
+	// explicit session_name regardless of whether --alias was supplied. This
+	// is what gives crew sessions readable tmux names like "crew--<rig>".
+	if resolved, err := workdirutil.ResolveTmuxAlias(cityPath, cityName, *agent, rigs); err != nil {
+		return "", fmt.Errorf("resolving tmux_alias: %w", err)
+	} else if resolved != "" {
+		return session.ValidateExplicitName(resolved)
+	}
+	if !agent.SupportsMultipleSessions() || strings.TrimSpace(alias) != "" {
 		return "", nil
 	}
 	return session.GenerateAdhocExplicitName(agent.Name)

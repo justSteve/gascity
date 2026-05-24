@@ -819,6 +819,9 @@ func defaultScaleCheckTargetForAgent(
 	return target
 }
 
+// defaultScaleCheckCounts reports ready, unassigned, routed work as fresh
+// generic pool demand. Assigned beads are handled by assigned-work collection
+// and named-session demand so they are intentionally excluded here.
 func defaultScaleCheckCounts(targets []defaultScaleCheckTarget) (map[string]int, map[string]bool, []error) {
 	counts := make(map[string]int, len(targets))
 	if len(targets) == 0 {
@@ -1541,12 +1544,12 @@ func desiredHasCanonicalNonExpandingPoolSession(desired map[string]TemplateParam
 }
 
 // poolRealizeParallelism caps the number of concurrent pool session bead
-// creates inside realizePoolDesiredSessions. Each create acquires a per-alias
-// session lock + commits to dolt; with N>cap pending creates the work pool
+// creates inside realizePoolDesiredSessions. Each create acquires per-identity
+// session locks + commits to dolt; with N>cap pending creates the work pool
 // drains in O(ceil(N/cap) × commit-latency) wall time instead of the prior
 // O(N × commit-latency). The cap is intentionally modest: dolt commit
-// contention and per-city alias-lock churn put a ceiling on useful
-// parallelism even when many distinct aliases are pending. See
+// contention and per-city identity-lock churn put a ceiling on useful
+// parallelism even when many distinct identities are pending. See
 // gastownhall/gascity#2319.
 const poolRealizeParallelism = 8
 
@@ -1627,10 +1630,11 @@ func realizePoolDesiredSessions(
 		items = append(items, planItem())
 	}
 
-	// Phase B (parallel, bounded): materialize planned creates. Per-alias
-	// session locks serialize same-alias calls; distinct aliases proceed in
-	// parallel up to poolRealizeParallelism workers. The store write and
-	// alias-conflict bookkeeping happen here.
+	// Phase B (parallel, bounded): materialize planned creates. Per-identity
+	// session locks serialize calls that share either the public alias or the
+	// resolved tmux_alias session name; distinct identities proceed in parallel
+	// up to poolRealizeParallelism workers. The store write and alias-conflict
+	// bookkeeping happen here.
 	pending := make([]int, 0, len(items))
 	for idx := range items {
 		if items[idx].plan != nil {
@@ -2366,9 +2370,9 @@ func selectOrPlanPoolSessionBead(
 
 // executePlannedPoolSessionBeadCreate materializes a pool session bead from a
 // plan produced by selectOrPlanPoolSessionBead. The underlying call is
-// createPoolSessionBeadWithGuardedAlias, whose per-alias session lock makes
-// concurrent invocations safe across distinct qualifiedInstance values. Calls
-// with the same qualifiedInstance are still serialized by the alias lock.
+// createPoolSessionBeadWithGuardedAlias, whose per-identity session locks make
+// concurrent invocations safe across both distinct qualifiedInstance values
+// and shared resolved tmux_alias values.
 func executePlannedPoolSessionBeadCreate(
 	bp *agentBuildParams,
 	cfgAgent *config.Agent,
@@ -2551,24 +2555,44 @@ func createPoolSessionBeadWithGuardedAlias(
 	if err := validateAgentSessionTransportForBuild(bp, cfgAgent, qualifiedInstance); err != nil {
 		return beads.Bead{}, err
 	}
+	resolvedTmuxAlias, err := bp.resolveTmuxAliasForAgent(cfgAgent)
+	if err != nil {
+		return beads.Bead{}, err
+	}
+	resolvedTmuxAlias, err = validateResolvedPoolTmuxAlias(template, resolvedTmuxAlias)
+	if err != nil {
+		return beads.Bead{}, err
+	}
 	identity := poolSessionCreateIdentity{
 		AgentName: qualifiedInstance,
 		Slot:      slot,
 	}
 	alias := strings.TrimSpace(qualifiedInstance)
-	if alias == "" || bp.beadStore == nil {
-		return createPoolSessionBead(bp.beadStore, template, bp.sessionBeads, poolSessionCreateStartedAt(bp), identity)
+	if bp.beadStore == nil {
+		return createPoolSessionBeadWithAlias(bp.beadStore, template, bp.city, bp.sessionBeads, poolSessionCreateStartedAt(bp), identity, resolvedTmuxAlias)
+	}
+	lockIDs := []string{}
+	if alias != "" {
+		lockIDs = append(lockIDs, alias)
+	}
+	if resolvedTmuxAlias != "" {
+		lockIDs = append(lockIDs, resolvedTmuxAlias)
+	}
+	if len(lockIDs) == 0 {
+		return createPoolSessionBeadWithAlias(bp.beadStore, template, bp.city, bp.sessionBeads, poolSessionCreateStartedAt(bp), identity, resolvedTmuxAlias)
 	}
 
 	var bead beads.Bead
 	createdWithLock := false
-	lockErr := session.WithCitySessionAliasLock(bp.cityPath, alias, func() error {
+	lockErr := session.WithCitySessionIdentifierLocks(bp.cityPath, lockIDs, func() error {
 		createIdentity := identity
-		if err := session.EnsureAliasAvailableWithConfig(bp.beadStore, bp.city, alias, ""); err == nil {
-			createIdentity.Alias = alias
+		if alias != "" {
+			if err := session.EnsureAliasAvailableWithConfig(bp.beadStore, bp.city, alias, ""); err == nil {
+				createIdentity.Alias = alias
+			}
 		}
 		var err error
-		bead, err = createPoolSessionBead(bp.beadStore, template, bp.sessionBeads, poolSessionCreateStartedAt(bp), createIdentity)
+		bead, err = createPoolSessionBeadWithAlias(bp.beadStore, template, bp.city, bp.sessionBeads, poolSessionCreateStartedAt(bp), createIdentity, resolvedTmuxAlias)
 		createdWithLock = true
 		return err
 	})
@@ -2578,7 +2602,7 @@ func createPoolSessionBeadWithGuardedAlias(
 	if lockErr != nil && bp.stderr != nil {
 		fmt.Fprintf(bp.stderr, "createPoolSessionBeadWithGuardedAlias: locking alias %q for %s: %v; creating without alias\n", alias, template, lockErr) //nolint:errcheck
 	}
-	return createPoolSessionBead(bp.beadStore, template, bp.sessionBeads, poolSessionCreateStartedAt(bp), identity)
+	return createPoolSessionBeadWithAlias(bp.beadStore, template, bp.city, bp.sessionBeads, poolSessionCreateStartedAt(bp), identity, "")
 }
 
 func isFailedCreateSessionBead(bead beads.Bead) bool {
